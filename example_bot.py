@@ -1,4 +1,4 @@
-"""v6 Zero-Leak Stealth Snowball + Strict Occlusion & Late-Game Closer."""
+"""v7 Precision Hitbox Aim, Roof-Edge Jiggle-Peek & Pulse-Jet Kiting AI."""
 import json
 import math
 import os
@@ -65,7 +65,7 @@ class ArenaMap:
                     height = top - base
                     if 9.0 <= height <= 48.0 and (maxx - minx) >= 15.0 and (maxy - miny) >= 15.0:
                         if point_in_poly(cx, cy, ring) and not any(point_in_poly(cx, cy, h) for h in p.get("holes", [])):
-                            self.rooftops.append((cx, cy, top))
+                            self.rooftops.append((cx, cy, top, (maxx - minx) * 0.5, (maxy - miny) * 0.5))
                     if height >= 10.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                         for idx in range(0, len(ring), 4):
                             vx, vy = ring[idx], ring[idx + 1]
@@ -189,8 +189,6 @@ class Bot:
         nrad = zone["next_radius"]
         max_r = max(14.0, nrad * 0.85)
 
-        # Early/Mid game: hug occluded wall cover on outer zone ring to avoid 15-bot hive-mind crossfire!
-        # Late game (<= 6 alive or >= 8 cubes): take dominant rooftop high ground!
         if alive > 6 and cubes < 8 and self.arena.cover_spots:
             nearby = []
             for sx, sy in self.arena.cover_spots:
@@ -208,17 +206,16 @@ class Bot:
                     continue
                 score = -d_me * 0.65 + (45.0 if d_next >= nrad * 0.40 else 0.0)
                 if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
-                    score += 80.0
+                    score += 85.0
                 if score > best_score:
                     best_score = score
-                    best = (sx, sy, gz)
+                    best = (sx, sy, gz, 6.0)
             if best is not None:
                 return best
 
-        # Rooftop anchor for late game or snowballed mech
         best = None
         best_score = -1e9
-        for rx, ry, rtop in self.arena.rooftops:
+        for rx, ry, rtop, hx, hy in self.arena.rooftops:
             d_next = math.hypot(rx - ncx, ry - ncy)
             if d_next > max_r:
                 continue
@@ -230,12 +227,12 @@ class Bot:
                 score += 40.0
             if score > best_score:
                 best_score = score
-                best = (rx, ry, rtop)
+                best = (rx, ry, rtop, min(hx, hy))
 
         if best is not None:
             return best
         ang = math.atan2(y - ncy, x - ncx)
-        return (ncx + math.cos(ang) * (max_r * 0.70), ncy + math.sin(ang) * (max_r * 0.70), 0.0)
+        return (ncx + math.cos(ang) * (max_r * 0.70), ncy + math.sin(ang) * (max_r * 0.70), 0.0, 6.0)
 
     def act(self, obs: mf.Observation) -> mf.Action:
         tick = obs["tick"]
@@ -248,7 +245,7 @@ class Bot:
         grounded = bool(me["grounded"])
         alive = int(obs["alive"])
 
-        if tick % 20 == 0:
+        if tick % 18 == 0:
             self.strafe_dir *= -1.0
 
         if self.prev_pos is not None:
@@ -321,14 +318,14 @@ class Bot:
             self.anchor = self._pick_anchor(x, y, z, zone, alive, me["cubes"])
             self.anchor_tick = tick
 
-        goal_x, goal_y, goal_z = self.anchor
+        goal_x, goal_y, goal_z, roof_rad = self.anchor
 
-        # Silent loot farming when no enemy mechs are nearby
+        # Silent loot farming when unthreatened
         farming_loot = False
         if not urgent_zone and not mechs and hp_frac > 0.55:
             near_cubes = [
                 c for c in obs.get("cubes", [])
-                if math.dist(c["pos"][:2], (x, y)) < 50.0 and abs(c["pos"][2] - z) < 12.0
+                if math.dist(c["pos"][:2], (x, y)) < 52.0 and abs(c["pos"][2] - z) < 12.0
             ]
             if near_cubes:
                 near_cubes.sort(key=lambda c: math.dist(c["pos"][:2], (x, y)))
@@ -337,7 +334,7 @@ class Bot:
             else:
                 near_weaps = [
                     p for p in obs.get("pickups", [])
-                    if math.dist(p["pos"][:2], (x, y)) < 42.0 and abs(p["pos"][2] - z) < 10.0 and self._weapon_rank(p["kind"]) >= 2
+                    if math.dist(p["pos"][:2], (x, y)) < 44.0 and abs(p["pos"][2] - z) < 10.0 and self._weapon_rank(p["kind"]) >= 2
                 ]
                 if near_weaps:
                     goal_x, goal_y, goal_z = near_weaps[0]["pos"]
@@ -348,16 +345,19 @@ class Bot:
         speed_scale = 1.0
         want_boost = False
         want_jump = False
+        pulse_ok = (tick % 6) < 3  # Pulse boost preserves energy reserves
 
-        incoming = [pr for pr in obs.get("projectiles", []) if math.dist(pr["pos"][:2], (x, y)) < 36.0]
+        is_reloading = bool(w0 and w0["kind"] == "gun" and w0.get("ammo", 12) == 0)
+
+        incoming = [pr for pr in obs.get("projectiles", []) if math.dist(pr["pos"][:2], (x, y)) < 38.0]
         if incoming:
             pr = incoming[0]
             p_yaw = math.atan2(pr["vel"][1], pr["vel"][0])
             move_yaw = wrap_angle(p_yaw + self.strafe_dir * (math.pi * 0.5))
-            want_boost = bool(energy > 35.0)
+            want_boost = bool(energy > 30.0 and pulse_ok)
         elif urgent_zone:
             move_yaw = math.atan2(ncy - y, ncx - x)
-            want_boost = bool((not in_zone) and energy > 20.0)
+            want_boost = bool((not in_zone) and energy > 18.0 and pulse_ok)
         elif mechs:
             closest = mechs[0]
             ex, ey, ez = closest["pos"]
@@ -365,16 +365,20 @@ class Bot:
             away_yaw = math.atan2(y - ey, x - ex)
             strafe_yaw = away_yaw + self.strafe_dir * (math.pi * 0.46)
 
-            if hp_frac < 0.50 or len(mechs) >= 2:
-                # Break LOS behind anchor/cover while returning fire!
+            if z > ez + 5.0 and dist_goal < max(10.0, roof_rad * 0.85):
+                # Roof-edge jiggle-peek: pull back toward roof center when hurt or reloading, peek edge when ready!
+                if hp_frac < 0.68 or is_reloading or len(mechs) >= 2:
+                    move_yaw = math.atan2(goal_y - y, goal_x - x) if dist_goal > 2.5 else away_yaw
+                    speed_scale = 1.0
+                else:
+                    move_yaw = strafe_yaw
+                    speed_scale = 0.78
+            elif hp_frac < 0.50 or len(mechs) >= 2:
                 move_yaw = math.atan2(
                     0.65 * math.sin(away_yaw) + 0.35 * math.sin(move_yaw),
                     0.65 * math.cos(away_yaw) + 0.35 * math.cos(move_yaw),
                 )
-                want_boost = bool(hp_frac < 0.40 and energy > 25.0)
-            elif z > ez + 5.0 and dist_goal < 14.0:
-                move_yaw = strafe_yaw
-                speed_scale = 0.8
+                want_boost = bool(hp_frac < 0.42 and energy > 22.0 and pulse_ok)
             else:
                 radial = 0.25 if edist < 65.0 else -0.20
                 move_yaw = math.atan2(
@@ -385,7 +389,6 @@ class Bot:
             if dist_goal < 3.5 and abs(z - goal_z) < 2.0:
                 speed_scale = 0.0
             elif tick > self.spotted_until_tick and not farming_loot:
-                # Move silently (<5.0 m/s) when unspotted so no bot hears footsteps!
                 walk_spd = me.get("stats", {}).get("walk_speed", 11.7)
                 speed_scale = min(1.0, (self.step_speed * 0.88) / max(1.0, walk_spd))
 
@@ -420,7 +423,7 @@ class Bot:
         act["boost"] = bool(want_boost)
         act["jump"] = bool(want_jump)
 
-        # Strict Line-of-Sight Combat: NEVER waste shots into walls!
+        # Precision Hitbox Aiming & Strict Line-of-Sight Combat
         muzzle_z = z + me.get("stats", {}).get("muzzle_height", 7.0)
         fire = [False, False]
         target_pos = None
@@ -439,7 +442,7 @@ class Bot:
                 to_me = math.atan2(y - m["pos"][1], x - m["pos"][0])
                 e_yaw = m.get("aim", [0.0, 0.0])[0]
                 is_rear = abs(wrap_angle(to_me - e_yaw)) > (math.pi * 0.5)
-                return d + hp * 0.06 - (45.0 if is_rear else 0.0)
+                return d + hp * 0.06 - (48.0 if is_rear else 0.0)
 
             best_m = min(clear_mechs, key=target_score)
             target_pos = best_m["pos"]
@@ -471,8 +474,10 @@ class Bot:
             aim_pitch = math.atan2(lead_z - muzzle_z, max(1.0, math.hypot(lead_x - x, lead_y - y)))
             act["aim"] = [aim_yaw, aim_pitch]
 
+            # Distance-scaled hitbox tolerance so long-range shots never miss wide
+            max_err = max(0.045, min(0.22, math.atan2(4.2, max(1.0, dist))))
             aim_err = abs(wrap_angle(aim_yaw - me["aim"][0]))
-            if aim_err < 0.24:
+            if aim_err < max_err:
                 for slot_idx, w in enumerate(me["weapons"]):
                     if w is None:
                         continue
@@ -502,7 +507,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v6 | Z:{z:.0f} HP:{me['hp']:.0f} C:{me['cubes']:.0f}")
+        mf.draw.label(f"v7 | Z:{z:.0f} HP:{me['hp']:.0f} C:{me['cubes']:.0f}")
         return act
 
 
