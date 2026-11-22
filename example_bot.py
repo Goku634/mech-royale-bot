@@ -1119,8 +1119,10 @@ class Bot:
                 look = self.last_hit_bearing
             elif tick - self.last_sound_tick < 12 and self.last_sound_bearing is not None:
                 look = self.last_sound_bearing
+            elif weave:
+                look = (tick * 0.09) % TAU
             else:
-                look = (tick * 0.175) % TAU
+                look = move_yaw + 1.8 * math.sin(tick * 0.12)
             out["aim"] = [wrap(look), 0.0]
             if gun_i is not None:
                 gw = weapons[gun_i]
