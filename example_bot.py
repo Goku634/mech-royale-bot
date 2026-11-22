@@ -1,4 +1,4 @@
-"""v19 Built on v17 (3.77): Corner Laser Pre-Charge, Anti-Wall Discharge & High-Ground Retention."""
+"""v20 Built Directly on v17 (3.77) + Canopy-Shielded Ground Fallback & Smart Magazine Discipline."""
 import json
 import math
 import os
@@ -32,6 +32,7 @@ class ArenaMap:
         self.prisms = []
         self.rooftops = []
         self.cover_spots = []
+        self.trees = []
         self.terrain = None
         self.nx = 0
         self.ny = 0
@@ -74,6 +75,19 @@ class ArenaMap:
                             if d > 1.0:
                                 self.cover_spots.append((vx + (dx / d) * 4.5, vy + (dy / d) * 4.5))
 
+            trees_obj = w.get("trees", {})
+            t_fields = trees_obj.get("fields", [])
+            t_data = trees_obj.get("data", [])
+            if t_fields and t_data:
+                stride = len(t_fields)
+                ix = t_fields.index("x") if "x" in t_fields else 0
+                iy = t_fields.index("y") if "y" in t_fields else 1
+                icr = t_fields.index("crownR") if "crownR" in t_fields else -1
+                for i in range(0, len(t_data) - stride + 1, stride * 2):
+                    cr = float(t_data[i + icr]) if icr >= 0 else 4.0
+                    if cr >= 3.5:
+                        self.trees.append((float(t_data[i + ix]), float(t_data[i + iy])))
+
             t_meta = w.get("terrain", {})
             self.nx = int(t_meta.get("nx", 0))
             self.ny = int(t_meta.get("ny", 0))
@@ -89,6 +103,15 @@ class ArenaMap:
                     self.terrain = struct.unpack(f"<{count}h", raw[: count * 2])
         except Exception as e:
             mf.log(f"Map load warning: {e}")
+
+    def canopy_density(self, x: float, y: float) -> int:
+        cnt = 0
+        for tx, ty in self.trees:
+            if abs(tx - x) < 16.0 and abs(ty - y) < 16.0:
+                cnt += 1
+                if cnt >= 4:
+                    break
+        return cnt
 
     def ground_z(self, x: float, y: float) -> float:
         if not self.terrain:
@@ -243,7 +266,8 @@ class Bot:
                 if self.arena.is_blocked(sx, sy, gz, pad=2.4):
                     continue
                 if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
-                    score = -d_me * 0.60 + 82.0 + (45.0 if d_next >= nrad * 0.45 else 0.0)
+                    canopy_bonus = self.arena.canopy_density(sx, sy) * 6.0
+                    score = -d_me * 0.60 + 82.0 + canopy_bonus + (45.0 if d_next >= nrad * 0.45 else 0.0)
                     if score > best_score:
                         best_score = score
                         best = (sx, sy, gz)
@@ -332,8 +356,8 @@ class Bot:
 
         dist_curr = math.hypot(x - zcx, y - zcy)
         dist_next = math.hypot(x - ncx, y - ncy)
-        # Hold high ground up until 6s before shrink starts so we farm ground rotators
-        urgent_zone = (not in_zone) or (dist_curr > zrad - 14.0) or (dist_next > nrad - 10.0 and t > zone["shrink_start"] - 6.0)
+        # Exact v17 zone rotation timing (prevents storm-wall pinches)
+        urgent_zone = (not in_zone) or (dist_curr > zrad - 18.0) or (dist_next > nrad - 12.0 and t > zone["shrink_start"] - 14.0)
 
         if (self.anchor is None or tick - self.anchor_tick > 55 or
                 math.hypot(self.anchor[0] - ncx, self.anchor[1] - ncy) > nrad * 0.88):
@@ -474,7 +498,6 @@ class Bot:
         muzzle_z = z + me.get("stats", {}).get("muzzle_height", 7.0)
         fire = [False, False]
         has_mortar = any(w and w["kind"] == "mortar" for w in me["weapons"])
-        laser_charging_now = any(w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.02 for w in me["weapons"])
 
         clear_mechs = [
             m for m in mechs
@@ -511,14 +534,14 @@ class Bot:
             target_pos = target_obj["pos"]
             target_vel = target_obj.get("vel", [0.0, 0.0, 0.0])
             target_h = 2.0
-        elif not mechs and npcs and (cubes < self.cube_cap or laser_charging_now) and hp_frac > 0.60 and math.dist(npcs[0]["pos"][:2], (x, y)) < 65.0:
+        elif not mechs and npcs and cubes < self.cube_cap and hp_frac > 0.60 and math.dist(npcs[0]["pos"][:2], (x, y)) < 55.0:
             if self.arena.has_clear_shot(x, y, muzzle_z, npcs[0]["pos"][0], npcs[0]["pos"][1], npcs[0]["pos"][2] + 1.8):
                 target_pos = npcs[0]["pos"]
                 target_vel = npcs[0].get("vel", [0.0, 0.0, 0.0])
                 target_h = 1.8
-        elif not mechs and obs.get("crates") and (cubes < self.cube_cap or laser_charging_now) and hp_frac > 0.65:
+        elif not mechs and obs.get("crates") and cubes < self.cube_cap and hp_frac > 0.65:
             crates = sorted(obs["crates"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
-            if math.dist(crates[0]["pos"][:2], (x, y)) < 55.0:
+            if math.dist(crates[0]["pos"][:2], (x, y)) < 40.0:
                 if self.arena.has_clear_shot(x, y, muzzle_z, crates[0]["pos"][0], crates[0]["pos"][1], crates[0]["pos"][2] + 1.2):
                     target_pos = crates[0]["pos"]
                     target_vel = [0.0, 0.0, 0.0]
@@ -531,7 +554,7 @@ class Bot:
 
             laser_ready_to_release = False
             for w in me["weapons"]:
-                if w and w["kind"] == "laser" and not target_is_occluded:
+                if w and w["kind"] == "laser" and not target_is_occluded and target_is_mech:
                     req_c = float(w.get("stats", {}).get("charge", 0.75)) * 0.84
                     if float(w.get("charge", 0.0)) >= req_c:
                         laser_ready_to_release = True
@@ -555,7 +578,7 @@ class Bot:
                 kind = w["kind"]
                 if kind == "laser":
                     l_range = float(w.get("stats", {}).get("range", 280.0))
-                    if target_is_occluded or dist > l_range - 2.0:
+                    if target_is_occluded or not target_is_mech or dist > l_range - 2.0:
                         fire[slot_idx] = False
                     else:
                         chg = float(w.get("charge", 0.0))
@@ -569,8 +592,10 @@ class Bot:
                                 fire[slot_idx] = True
                 elif kind == "gun":
                     g_range = float(w.get("stats", {}).get("range", 230.0))
+                    # Tighten spread tolerance at extreme range (>150m) so 12-round mag stays loaded for real hits
+                    max_gun_err = 0.13 if dist > 150.0 else 0.22
                     if not target_is_occluded and dist <= g_range:
-                        if yaw_err < 0.22 and pitch_err < 0.26:
+                        if yaw_err < max_gun_err and pitch_err < 0.24:
                             fire[slot_idx] = True
                 elif kind == "lightning":
                     lt_range = float(w.get("stats", {}).get("range", 45.0))
@@ -590,21 +615,8 @@ class Bot:
 
             mf.draw.line([x, y, muzzle_z], [lead_x, lead_y, lead_z], "#ff5040")
         else:
-            # Corner Laser Pre-Charge: if enemy tracked within 90m behind cover, pre-aim & hold laser charge!
             if mechs:
-                ex, ey, ez = mechs[0]["pos"]
-                evx, evy, _ = mechs[0].get("vel", [0.0, 0.0, 0.0])
-                edist = math.hypot(ex - x, ey - y)
-                pred_x = ex + evx * 0.35
-                pred_y = ey + evy * 0.35
-                act["aim"] = [
-                    math.atan2(pred_y - y, pred_x - x),
-                    math.atan2((ez + 4.5) - muzzle_z, max(1.0, math.hypot(pred_x - x, pred_y - y))),
-                ]
-                for slot_idx, w in enumerate(me["weapons"]):
-                    if w and w["kind"] == "laser" and edist <= 110.0:
-                        if float(w.get("charge", 0.0)) < 1.35:
-                            fire[slot_idx] = True
+                act["aim"] = [math.atan2(mechs[0]["pos"][1] - y, mechs[0]["pos"][0] - x), 0.0]
             elif tick - self.last_threat_tick < 60 and self.last_threat_yaw is not None:
                 act["aim"] = [self.last_threat_yaw, 0.0]
             elif micro_weaving:
@@ -618,7 +630,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v19 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v20 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
