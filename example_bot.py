@@ -1,4 +1,4 @@
-"""v15 Wall-Edge Pre-Jump Rooftop Physics, Building-Shadow Cover & 75m Loot Snowball."""
+"""v16 Built on v15 (2.68): Pre-Aimed Front Armor, Roof-Center Tether & Gun+Special Slot Lock."""
 import json
 import math
 import os
@@ -63,11 +63,9 @@ class ArenaMap:
                     }
                     self.prisms.append(prism)
                     height = top - base
-                    # Fast-climb roofs (9m-18m): take ~1.1s & ~18 energy to clear cleanly
                     if 9.0 <= height <= 18.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                         if point_in_poly(cx, cy, ring) and not any(point_in_poly(cx, cy, h) for h in p.get("holes", [])):
                             self.rooftops.append((cx, cy, top, height))
-                    # Tall buildings (>=12m) provide 360-deg visual shields on ground corners
                     if height >= 12.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                         for idx in range(0, len(ring), 4):
                             vx, vy = ring[idx], ring[idx + 1]
@@ -212,7 +210,6 @@ class Bot:
         nrad = zone["next_radius"]
         max_r = max(14.0, nrad * 0.86)
 
-        # Combine fast-climb rooftops (9-18m) AND building-shadow ground cover into one unified tactical score
         best = None
         best_score = -1e9
 
@@ -245,7 +242,6 @@ class Bot:
                 gz = self.arena.ground_z(sx, sy)
                 if self.arena.is_blocked(sx, sy, gz, pad=2.4):
                     continue
-                # Only prefer ground cover if a tall building physically blocks LOS to the crowded zone center
                 if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
                     score = -d_me * 0.60 + 82.0 + (45.0 if d_next >= nrad * 0.45 else 0.0)
                     if score > best_score:
@@ -308,6 +304,7 @@ class Bot:
                 self.last_threat_yaw = s["bearing"]
                 self.last_threat_tick = tick
 
+        # Always keep Gun in Slot 0; only fill/upgrade Slot 1 with special weapons (Laser > Lightning > Mortar)
         w0, w1 = me["weapons"][0], me["weapons"][1]
         best_pickup = None
         for p in obs.get("pickups", []):
@@ -315,20 +312,18 @@ class Bot:
                 p_kind = p["kind"]
                 if (w0 and w0["kind"] == p_kind) or (w1 and w1["kind"] == p_kind):
                     continue
+                if self._weapon_rank(p_kind) < 2:
+                    continue
                 if best_pickup is None or self._weapon_rank(p_kind) > self._weapon_rank(best_pickup["kind"]):
                     best_pickup = p
 
         if best_pickup:
-            if w1 is None or w0 is None:
+            if w1 is None:
                 act["take"] = best_pickup["id"]
-            else:
-                r0, r1 = self._weapon_rank(w0["kind"]), self._weapon_rank(w1["kind"])
-                if self._weapon_rank(best_pickup["kind"]) > min(r0, r1):
-                    drop_slot = 1 if r1 <= r0 else 0
-                    slot_w = me["weapons"][drop_slot]
-                    if not (slot_w and slot_w["kind"] == "laser" and slot_w.get("charge", 0) > 0):
-                        act["take"] = best_pickup["id"]
-                        act["drop"] = drop_slot
+            elif self._weapon_rank(best_pickup["kind"]) > self._weapon_rank(w1["kind"]):
+                if not (w1["kind"] == "laser" and w1.get("charge", 0) > 0):
+                    act["take"] = best_pickup["id"]
+                    act["drop"] = 1
 
         zone = obs["zone"]
         zcx, zcy = zone["center"]
@@ -347,7 +342,6 @@ class Bot:
 
         goal_x, goal_y, goal_z = self.anchor
 
-        # Uncontested Supply Drop capture (+3 cubes + full heal)
         capturing_drop = False
         if not urgent_zone and len(mechs) <= 1 and (cubes < self.cube_cap or hp_frac < 0.70):
             for dr in obs.get("drops", []):
@@ -357,7 +351,6 @@ class Bot:
                         capturing_drop = True
                         break
 
-        # 75m opportunistic loot & special-weapon sweep when safe
         farming_loot = False
         if not urgent_zone and not capturing_drop and not mechs and hp_frac > 0.52:
             if cubes < self.cube_cap:
@@ -424,8 +417,13 @@ class Bot:
                 )
                 want_boost = bool(hp_frac < 0.40 and energy > 25.0)
             elif z > ez + 5.0 and dist_goal < 14.0:
-                move_yaw = strafe_yaw
-                speed_scale = 0.8
+                # Roof-Center Tether: never strafe off the edge of our roof!
+                if dist_goal > 5.5:
+                    move_yaw = math.atan2(goal_y - y, goal_x - x)
+                    speed_scale = 0.85
+                else:
+                    move_yaw = strafe_yaw
+                    speed_scale = 0.70
             else:
                 radial = 0.25 if edist < 65.0 else -0.20
                 move_yaw = math.atan2(
@@ -436,27 +434,23 @@ class Bot:
             if dist_goal < 3.5 and abs(z - goal_z) < 2.0:
                 speed_scale = 0.0
 
-        # Wall-Edge Pre-Jump Rooftop Physics: detect the building wall 5m ahead and jet cleanly over its lip!
         if speed_scale > 0.05:
             probe_x = x + math.cos(move_yaw) * 5.0
             probe_y = y + math.sin(move_yaw) * 5.0
             wall = self.arena.blocking_prism(probe_x, probe_y, z, pad=2.8)
             if wall is not None:
                 wall_h = wall["top"] - z
-                # If this wall is our target roof (or a climbable <=18m building) and we have energy, jump BEFORE hitting the wall!
                 if wall_h <= 18.5 and ((not grounded and energy > 10.0) or (grounded and energy >= 38.0)):
                     if grounded:
                         want_jump = True
                     want_boost = True
                 else:
-                    # Steer cleanly around tall (>18.5m) buildings instead of wasting energy climbing them
                     for offset in (0.6, -0.6, 1.2, -1.2, 1.8, -1.8, 2.4):
                         alt = wrap_angle(move_yaw + offset)
                         if not self.arena.is_blocked(x + math.cos(alt) * 5.5, y + math.sin(alt) * 5.5, z):
                             move_yaw = alt
                             break
 
-        # Keep jetting upward until feet clear the roof lip (z >= goal_z - 0.5)
         if not grounded and goal_z > z + 0.5 and dist_goal < 28.0 and energy > 10.0:
             want_boost = True
 
@@ -583,19 +577,23 @@ class Bot:
 
             mf.draw.line([x, y, muzzle_z], [lead_x, lead_y, lead_z], "#ff5040")
         else:
+            # Keep 180-deg front armor facing threats/zone center instead of exposing our back!
             if mechs:
                 act["aim"] = [math.atan2(mechs[0]["pos"][1] - y, mechs[0]["pos"][0] - x), 0.0]
             elif tick - self.last_threat_tick < 60 and self.last_threat_yaw is not None:
                 act["aim"] = [self.last_threat_yaw, 0.0]
+            elif speed_scale < 0.1:
+                center_yaw = math.atan2(ncy - y, ncx - x)
+                act["aim"] = [wrap_angle(center_yaw + 0.95 * math.sin(tick * 0.18)), 0.0]
             else:
-                act["aim"] = [wrap_angle(me["aim"][0] + 0.32), 0.0]
+                act["aim"] = [wrap_angle(move_yaw + 0.95 * math.sin(tick * 0.22)), 0.0]
 
             if w0 and w0["kind"] == "gun" and w0.get("ammo", 12) < w0.get("stats", {}).get("mag", 12):
                 act["reload"] = True
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v15 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v16 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
