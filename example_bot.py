@@ -1,4 +1,4 @@
-"""v25 Built on v17 (3.77) Core: High-Altitude Fortress Rooftops (22-48m) & Full-Tank Climb."""
+"""v26 High-Ground Rim Cover-Peeking, 50-Deg Terrain Slope Avoidance & Anti-Crossfire Break-LOS."""
 import json
 import math
 import os
@@ -93,12 +93,11 @@ class ArenaMap:
                 self.prisms.append(prism)
                 gz_c = self.ground_z(cx, cy)
                 climb_h = top - gz_c
-                # Climbable campus roofs up to 48m (within 100-energy 60m max climb)
-                if 10.0 <= climb_h <= 48.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
+                if 10.0 <= climb_h <= 42.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                     if point_in_poly(cx, cy, ring) and not any(point_in_poly(cx, cy, h) for h in holes):
                         self.rooftops.append((cx, cy, top, climb_h))
-                if (top - base) >= 12.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
-                    for idx in range(0, len(ring), 4):
+                if (top - base) >= 11.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
+                    for idx in range(0, len(ring), 2):
                         vx, vy = ring[idx], ring[idx + 1]
                         dx, dy = vx - cx, vy - cy
                         d = math.hypot(dx, dy)
@@ -128,6 +127,15 @@ class ArenaMap:
         z11 = self.terrain[row1 + i + 1]
         return (z00 * (1 - dx) * (1 - dy) + z10 * dx * (1 - dy) +
                 z01 * (1 - dx) * dy + z11 * dx * dy) * 0.01
+
+    def is_steep_slope(self, x1: float, y1: float, x2: float, y2: float) -> bool:
+        if not self.terrain:
+            return False
+        d = math.hypot(x2 - x1, y2 - y1)
+        if d < 0.5:
+            return False
+        dz = self.ground_z(x2, y2) - self.ground_z(x1, y1)
+        return (dz / d) > 1.15  # > 49 deg slope blocks walking (protocol.md §7)
 
     def blocking_prism(self, x: float, y: float, z: float, pad: float = 2.8):
         for p in self.prisms:
@@ -241,11 +249,10 @@ class Bot:
             if d_next > max_r:
                 continue
             d_me = math.hypot(rx - x, ry - y)
-            if d_me > 195.0:
+            if d_me > 190.0:
                 continue
-            # Strongly reward high 22-45m fortress roofs where ground bots can't easily jump-swarm!
-            score = -d_me * 0.55 + min(42.0, h) * 2.1
-            if nrad * 0.35 <= d_next <= max_r:
+            score = -d_me * 0.58 + (26.0 - abs(h - 19.0)) * 1.6
+            if nrad * 0.38 <= d_next <= max_r:
                 score += 65.0
             if alive <= 7:
                 score += 40.0
@@ -253,7 +260,7 @@ class Bot:
                 best_score = score
                 best = (rx, ry, rtop)
 
-        if alive > 6 and self.arena.cover_spots:
+        if alive > 5 and self.arena.cover_spots:
             nearby = []
             for sx, sy in self.arena.cover_spots:
                 d_next = math.hypot(sx - ncx, sy - ncy)
@@ -262,12 +269,12 @@ class Bot:
                     if d_me <= 165.0:
                         nearby.append((d_me, d_next, sx, sy))
             nearby.sort(key=lambda item: item[0])
-            for d_me, d_next, sx, sy in nearby[:14]:
+            for d_me, d_next, sx, sy in nearby[:16]:
                 gz = self.arena.ground_z(sx, sy)
                 if self.arena.is_blocked(sx, sy, gz, pad=2.4):
                     continue
                 if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
-                    score = -d_me * 0.60 + 78.0 + (45.0 if d_next >= nrad * 0.45 else 0.0)
+                    score = -d_me * 0.60 + 84.0 + (45.0 if d_next >= nrad * 0.45 else 0.0)
                     if score > best_score:
                         best_score = score
                         best = (sx, sy, gz)
@@ -276,6 +283,19 @@ class Bot:
             return best
         ang = math.atan2(y - ncy, x - ncx)
         return (ncx + math.cos(ang) * (max_r * 0.72), ncy + math.sin(ang) * (max_r * 0.72), 0.0)
+
+    def _find_hard_cover(self, x: float, y: float, z: float, ex: float, ey: float, ez: float) -> tuple:
+        best = None
+        best_d = 48.0
+        for sx, sy in self.arena.cover_spots:
+            d = math.hypot(sx - x, sy - y)
+            if d < best_d:
+                gz = self.arena.ground_z(sx, sy)
+                if abs(gz - z) <= 4.5 and not self.arena.is_blocked(sx, sy, gz, pad=2.4):
+                    if not self.arena.has_clear_shot(sx, sy, gz + 6.5, ex, ey, ez + 4.5):
+                        best_d = d
+                        best = (sx, sy)
+        return best
 
     def _mortar_pitch(self, dist: float, dz: float, speed: float) -> float:
         g = self.mortar_g
@@ -411,6 +431,10 @@ class Bot:
         enemy_charging = next((m for m in mechs if m.get("charging")), None)
         incoming = [pr for pr in obs.get("projectiles", []) if math.dist(pr["pos"][:2], (x, y)) < 36.0]
 
+        # Check if burst weapons are cooling/reloading so we tuck into cover between shots
+        gun_reloading = bool(w0 and w0["kind"] == "gun" and w0.get("reload", 0.0) > 0.2)
+        laser_cooling = bool(w1 and w1["kind"] == "laser" and w1.get("cooldown", 0.0) > 0.25)
+
         if enemy_charging is not None:
             ex, ey, _ = enemy_charging["pos"]
             to_me = math.atan2(y - ey, x - ex)
@@ -435,11 +459,16 @@ class Bot:
             strafe_yaw = away_yaw + self.strafe_dir * (math.pi * 0.46)
 
             if hp_frac < 0.50 or len(mechs) >= 2:
-                move_yaw = math.atan2(
-                    0.65 * math.sin(away_yaw) + 0.35 * math.sin(move_yaw),
-                    0.65 * math.cos(away_yaw) + 0.35 * math.cos(move_yaw),
-                )
-                want_boost = bool(hp_frac < 0.40 and energy > 25.0)
+                # Break line-of-sight immediately when outnumbered or <50% HP so nanites heal us
+                cover_pt = self._find_hard_cover(x, y, z, ex, ey, ez)
+                if cover_pt is not None:
+                    move_yaw = math.atan2(cover_pt[1] - y, cover_pt[0] - x)
+                else:
+                    move_yaw = math.atan2(
+                        0.65 * math.sin(away_yaw) + 0.35 * math.sin(move_yaw),
+                        0.65 * math.cos(away_yaw) + 0.35 * math.cos(move_yaw),
+                    )
+                want_boost = bool((hp_frac < 0.42 or len(mechs) >= 2) and energy > 28.0)
             elif z > ez + 5.0 and dist_goal < 14.0:
                 if dist_goal > 5.5:
                     move_yaw = math.atan2(goal_y - y, goal_x - x)
@@ -447,6 +476,13 @@ class Bot:
                 else:
                     move_yaw = strafe_yaw
                     speed_scale = 0.70
+            elif gun_reloading and laser_cooling:
+                # Step back toward cover while both gun & laser are on cooldown
+                cover_pt = self._find_hard_cover(x, y, z, ex, ey, ez)
+                if cover_pt is not None:
+                    move_yaw = math.atan2(cover_pt[1] - y, cover_pt[0] - x)
+                else:
+                    move_yaw = away_yaw
             else:
                 radial = 0.25 if edist < 65.0 else -0.20
                 move_yaw = math.atan2(
@@ -463,15 +499,16 @@ class Bot:
                 speed_scale = min(0.42, (self.step_speed * 0.86) / max(1.0, walk_spd))
                 micro_weaving = True
 
-        # Full-tank wall-edge pre-jump for 10m-48m fortress rooftops
+        # Check both building walls AND >49 deg terrain slopes before stepping
         if speed_scale > 0.05 and not micro_weaving:
             probe_x = x + math.cos(move_yaw) * 5.0
             probe_y = y + math.sin(move_yaw) * 5.0
             wall = self.arena.blocking_prism(probe_x, probe_y, z, pad=2.8)
+            steep = grounded and self.arena.is_steep_slope(x, y, probe_x, probe_y)
             if wall is not None:
                 wall_h = wall["top"] - z
-                req_energy = 72.0 if wall_h > 22.0 else 38.0
-                if wall_h <= 48.5 and ((not grounded and energy > 8.0) or (grounded and energy >= req_energy)):
+                req_energy = 68.0 if wall_h > 22.0 else 38.0
+                if wall_h <= 42.5 and ((not grounded and energy > 8.0) or (grounded and energy >= req_energy)):
                     if grounded:
                         want_jump = True
                     want_boost = True
@@ -481,8 +518,15 @@ class Bot:
                         if not self.arena.is_blocked(x + math.cos(alt) * 5.5, y + math.sin(alt) * 5.5, z):
                             move_yaw = alt
                             break
+            elif steep:
+                for offset in (0.6, -0.6, 1.2, -1.2, 1.8, -1.8):
+                    alt = wrap_angle(move_yaw + offset)
+                    ax, ay = x + math.cos(alt) * 5.0, y + math.sin(alt) * 5.0
+                    if not self.arena.is_blocked(ax, ay, z) and not self.arena.is_steep_slope(x, y, ax, ay):
+                        move_yaw = alt
+                        break
 
-        if not grounded and goal_z > z + 0.5 and dist_goal < 32.0 and energy > 8.0:
+        if not grounded and goal_z > z + 0.5 and dist_goal < 30.0 and energy > 8.0:
             want_boost = True
 
         if self.stuck_ticks >= 4 and speed_scale > 0.05 and not micro_weaving:
@@ -629,7 +673,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v25 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v26 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
