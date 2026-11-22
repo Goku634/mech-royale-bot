@@ -731,7 +731,7 @@ class Bot:
                     goal_kind = "explore"
             max_r = max(14.0, nrad * 0.86)
             if (goal is None and not lacks_laser and not urgent_zone and hpf > 0.4
-                    and tick >= self.perch_off_until):
+                    and False):
                 if (self.perch is None or tick - self.perch_tick > 150 or
                         hyp(self.perch[0], self.perch[1], ncx, ncy) > max(14.0, nrad * 0.86)):
                     self.perch = self.pick_perch(x, y, zone)
