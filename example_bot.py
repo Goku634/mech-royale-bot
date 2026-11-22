@@ -1,4 +1,4 @@
-"""v11 Built on v9 (2.54) Base: Fast 10-Cube Snowball, Rooftop Dominance, 270-Deg Scan & Laser Release."""
+"""v12 Built on v9 (2.54): Priority RMB Weapon Hunt, Dynamic Roof-Hopping & Dual-Weapon Burst."""
 import json
 import math
 import os
@@ -140,6 +140,7 @@ class Bot:
         self.strafe_dir = 1.0
         self.roof_goal = None
         self.roof_tick = -999
+        self.last_roof = None
 
     def _choose_upgrade(self, offer: dict) -> int:
         choices = offer.get("choices", [])
@@ -160,7 +161,7 @@ class Bot:
     def _weapon_rank(self, kind: str) -> int:
         return {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}.get(kind, 0)
 
-    def _pick_rooftop(self, x: float, y: float, z: float, zone: dict) -> tuple:
+    def _pick_rooftop(self, x: float, y: float, z: float, zone: dict, relocate: bool = False) -> tuple:
         ncx, ncy = zone["next_center"]
         nrad = zone["next_radius"]
         max_r = max(14.0, nrad * 0.85)
@@ -172,9 +173,12 @@ class Bot:
             if d_next > max_r:
                 continue
             d_me = math.hypot(rx - x, ry - y)
-            if d_me > 190.0:
+            if d_me > 195.0:
                 continue
-            score = -d_me * 0.65 + min(36.0, rtop) * 1.5
+            # If relocating after taking heavy heat, avoid the roof we are currently standing on!
+            if relocate and d_me < 25.0:
+                continue
+            score = -d_me * 0.60 + min(38.0, rtop) * 1.5
             if nrad * 0.35 <= d_next <= max_r:
                 score += 55.0
             if score > best_score:
@@ -227,17 +231,21 @@ class Bot:
         mechs.sort(key=lambda m: math.dist(m["pos"], me["pos"]))
         npcs.sort(key=lambda m: math.dist(m["pos"], me["pos"]))
 
+        heavy_hit = False
         for ev in obs.get("events", []):
-            if ev.get("type") == "damaged" and ev.get("bearing") is not None:
-                self.last_threat_yaw = ev["bearing"]
-                self.last_threat_tick = tick
+            if ev.get("type") == "damaged":
+                if ev.get("amount", 0) >= 90:
+                    heavy_hit = True
+                if ev.get("bearing") is not None:
+                    self.last_threat_yaw = ev["bearing"]
+                    self.last_threat_tick = tick
 
         for s in obs.get("sounds", []):
             if s.get("dist") in ("near", "mid"):
                 self.last_threat_yaw = s["bearing"]
                 self.last_threat_tick = tick
 
-        # Weapon pickup & swap
+        # Weapon pickup & swap (always fill RMB empty slot immediately!)
         w0, w1 = me["weapons"][0], me["weapons"][1]
         best_pickup = None
         for p in obs.get("pickups", []):
@@ -270,32 +278,36 @@ class Bot:
         dist_next = math.hypot(x - ncx, y - ncy)
         urgent_zone = (not in_zone) or (dist_curr > zrad - 18.0) or (dist_next > nrad - 12.0 and t > zone["shrink_start"] - 14.0)
 
-        if (self.roof_goal is None or tick - self.roof_tick > 55 or
+        # Dynamic roof-hopping: relocate if taking heavy fire / 2+ enemies converge so we never get swarmed!
+        need_relocate = (heavy_hit and hp_frac < 0.65) or (len(mechs) >= 2 and hp_frac < 0.75)
+        if (self.roof_goal is None or tick - self.roof_tick > 55 or need_relocate or
                 math.hypot(self.roof_goal[0] - ncx, self.roof_goal[1] - ncy) > nrad * 0.88):
-            self.roof_goal = self._pick_rooftop(x, y, z, zone)
+            self.roof_goal = self._pick_rooftop(x, y, z, zone, relocate=need_relocate)
             self.roof_tick = tick
 
         goal_x, goal_y, goal_z = self.roof_goal
 
-        # Fast 10-cube & weapon snowballing whenever not actively fighting a mech
+        # Priority 1: Fill RMB empty slot with a special weapon (Laser/Lightning/Mortar) up to 95m away!
         farming_loot = False
-        if not urgent_zone and not mechs and hp_frac > 0.45:
-            if cubes < self.cube_cap:
+        has_special = any(w and w["kind"] in ("laser", "lightning", "mortar") for w in me["weapons"])
+        if not urgent_zone and not mechs and hp_frac > 0.50:
+            if not has_special:
+                specials = [
+                    p for p in obs.get("pickups", [])
+                    if math.dist(p["pos"][:2], (x, y)) < 95.0 and self._weapon_rank(p["kind"]) >= 2
+                ]
+                if specials:
+                    specials.sort(key=lambda p: (math.dist(p["pos"][:2], (x, y)) - self._weapon_rank(p["kind"]) * 12.0))
+                    goal_x, goal_y, goal_z = specials[0]["pos"]
+                    farming_loot = True
+            if not farming_loot and cubes < self.cube_cap:
                 near_cubes = [
                     c for c in obs.get("cubes", [])
-                    if math.dist(c["pos"][:2], (x, y)) < 68.0 and abs(c["pos"][2] - z) < 14.0
+                    if math.dist(c["pos"][:2], (x, y)) < 58.0 and abs(c["pos"][2] - z) < 12.0
                 ]
                 if near_cubes:
                     near_cubes.sort(key=lambda c: math.dist(c["pos"][:2], (x, y)))
                     goal_x, goal_y, goal_z = near_cubes[0]["pos"]
-                    farming_loot = True
-            if not farming_loot:
-                near_weaps = [
-                    p for p in obs.get("pickups", [])
-                    if math.dist(p["pos"][:2], (x, y)) < 52.0 and abs(p["pos"][2] - z) < 12.0 and self._weapon_rank(p["kind"]) >= 2
-                ]
-                if near_weaps:
-                    goal_x, goal_y, goal_z = near_weaps[0]["pos"]
                     farming_loot = True
 
         avoid_cube = None
@@ -337,15 +349,15 @@ class Bot:
             away_yaw = math.atan2(y - ey, x - ex)
             strafe_yaw = away_yaw + self.strafe_dir * (math.pi * 0.46)
 
-            if hp_frac < 0.45 or len(mechs) >= 2:
+            if hp_frac < 0.48 or len(mechs) >= 2:
                 move_yaw = math.atan2(
                     0.65 * math.sin(away_yaw) + 0.35 * math.sin(move_yaw),
                     0.65 * math.cos(away_yaw) + 0.35 * math.cos(move_yaw),
                 )
-                want_boost = bool(hp_frac < 0.38 and energy > 25.0)
+                want_boost = bool(hp_frac < 0.40 and energy > 25.0)
             elif z > ez + 5.0 and dist_goal < 14.0:
                 move_yaw = strafe_yaw
-                speed_scale = 0.82
+                speed_scale = 0.8
             else:
                 radial = 0.25 if edist < 65.0 else -0.20
                 move_yaw = math.atan2(
@@ -356,8 +368,8 @@ class Bot:
             if dist_goal < 3.5 and abs(z - goal_z) < 2.0:
                 speed_scale = 0.0
 
-        # Jetpack climb onto rooftop
-        if not farming_loot and goal_z > z + 2.0 and dist_goal < 26.0 and energy > 22.0:
+        # Jetpack flight onto elevated pickups or rooftops
+        if goal_z > z + 2.0 and dist_goal < 26.0 and energy > 22.0:
             if grounded:
                 want_jump = True
             want_boost = True
@@ -388,7 +400,7 @@ class Bot:
         act["boost"] = bool(want_boost)
         act["jump"] = bool(want_jump)
 
-        # Relentless Combat (never turn off guns when an enemy has LOS!)
+        # v9's proven combat + hitscan laser release + mortar lob
         muzzle_z = z + me.get("stats", {}).get("muzzle_height", 7.0)
         fire = [False, False]
         has_mortar = any(w and w["kind"] == "mortar" for w in me["weapons"])
@@ -421,21 +433,21 @@ class Bot:
             target_pos = target_obj["pos"]
             target_vel = target_obj.get("vel", [0.0, 0.0, 0.0])
             target_h = 4.5
-        elif occluded_mechs and math.dist(occluded_mechs[0]["pos"][:2], (x, y)) <= 195.0:
+        elif occluded_mechs and math.dist(occluded_mechs[0]["pos"][:2], (x, y)) <= 190.0:
             target_obj = occluded_mechs[0]
             target_is_mech = True
             target_is_occluded = True
             target_pos = target_obj["pos"]
             target_vel = target_obj.get("vel", [0.0, 0.0, 0.0])
             target_h = 2.0
-        elif not mechs and npcs and cubes < self.cube_cap and hp_frac > 0.45 and math.dist(npcs[0]["pos"][:2], (x, y)) < 85.0:
+        elif not mechs and npcs and cubes < self.cube_cap and hp_frac > 0.60 and math.dist(npcs[0]["pos"][:2], (x, y)) < 55.0:
             if self.arena.has_clear_shot(x, y, muzzle_z, npcs[0]["pos"][0], npcs[0]["pos"][1], npcs[0]["pos"][2] + 1.8):
                 target_pos = npcs[0]["pos"]
                 target_vel = npcs[0].get("vel", [0.0, 0.0, 0.0])
                 target_h = 1.8
-        elif not mechs and obs.get("crates") and cubes < self.cube_cap and hp_frac > 0.50:
+        elif not mechs and obs.get("crates") and cubes < self.cube_cap and hp_frac > 0.65:
             crates = sorted(obs["crates"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
-            if math.dist(crates[0]["pos"][:2], (x, y)) < 65.0:
+            if math.dist(crates[0]["pos"][:2], (x, y)) < 42.0:
                 if self.arena.has_clear_shot(x, y, muzzle_z, crates[0]["pos"][0], crates[0]["pos"][1], crates[0]["pos"][2] + 1.2):
                     target_pos = crates[0]["pos"]
                     target_vel = [0.0, 0.0, 0.0]
@@ -498,18 +510,17 @@ class Bot:
         else:
             if mechs:
                 act["aim"] = [math.atan2(mechs[0]["pos"][1] - y, mechs[0]["pos"][0] - x), 0.0]
-            elif tick - self.last_threat_tick < 55 and self.last_threat_yaw is not None:
+            elif tick - self.last_threat_tick < 60 and self.last_threat_yaw is not None:
                 act["aim"] = [self.last_threat_yaw, 0.0]
             else:
-                scan_offset = 1.30 * math.sin(tick * 0.26)
-                act["aim"] = [wrap_angle(move_yaw + scan_offset), 0.0]
+                act["aim"] = [wrap_angle(me["aim"][0] + 0.32), 0.0]
 
             if w0 and w0["kind"] == "gun" and w0.get("ammo", 12) < w0.get("stats", {}).get("mag", 12):
                 act["reload"] = True
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v11 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v12 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
