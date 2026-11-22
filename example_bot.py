@@ -631,6 +631,10 @@ class Bot:
         if best_p is not None:
             if w1 is None:
                 out["take"] = best_p["id"]
+            elif w0 is not None and w0["kind"] == "gun" and w1["kind"] in ("laser", "lightning"):
+                if not (w1["kind"] == "laser" and w1.get("charge", 0) > 0):
+                    out["take"] = best_p["id"]
+                    out["drop"] = 0
             elif WEAPON_RANK.get(best_p["kind"], 0) > WEAPON_RANK.get(w1["kind"], 0):
                 if not (w1["kind"] == "laser" and w1.get("charge", 0) > 0):
                     out["take"] = best_p["id"]
@@ -783,7 +787,8 @@ class Bot:
                     rk = WEAPON_RANK.get(k, 0)
                     if rk == 0 or k in mine_kinds:
                         continue
-                    if w1 is not None and rk <= WEAPON_RANK.get(w1["kind"], 0):
+                    if (w1 is not None and rk <= WEAPON_RANK.get(w1["kind"], 0) and
+                            not (w0 is not None and w0["kind"] == "gun")):
                         continue
                     dd = hyp(e[0], e[1], x, y)
                     lim = 280.0 if (lacks or w1 is None) else 90.0
@@ -802,7 +807,7 @@ class Bot:
                     bc = None
                     for i, e in self.mem["cubes"].items():
                         dd = hyp(e[0], e[1], x, y)
-                        if dd < 85.0 and abs(e[2] - z) < 13.0 and (e[2] - z < 3.0 or energy > 55.0):
+                        if dd < 140.0 and abs(e[2] - z) < 13.0 and (e[2] - z < 3.0 or energy > 55.0):
                             if bc is None or dd < bc[0]:
                                 bc = (dd, e)
                     if bc is not None:
@@ -910,7 +915,7 @@ class Bot:
             self.cover = None
             self.cover_off_until = tick + 60
         if len(contacts) >= 2 and not urgent_zone and tick >= self.cover_off_until:
-            need = len(seers) >= 2 or (len(seers) >= 1 and len(contacts) >= 3)
+            need = len(seers) >= 2
             cdist = hyp(self.cover[0], self.cover[1], x, y) if self.cover is not None else 999.0
             if need and (self.cover is None or tick - self.cover_tick >= 10):
                 if (time.perf_counter() - t0) < 0.018:
@@ -1240,4 +1245,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# v41 peek fighter, hides early when 3+ enemies are near
+# v43 = v40 + carry laser and lightning together + collect cubes from 140 m
