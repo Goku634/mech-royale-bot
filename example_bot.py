@@ -883,7 +883,7 @@ class Bot:
                 move_yaw = wrap(desired + self.escape_sign * 1.4)
             else:
                 wall = self.arena.blocking_prism(x + math.cos(desired) * 5.0, y + math.sin(desired) * 5.0, z)
-                if (wall is not None and climb_ok and (wall["top"] - z) <= 999.0 and
+                if (wall is not None and climb_ok and (wall["top"] - z) <= 18.5 and
                         ((not grounded and energy > 10.0) or (grounded and energy >= 38.0))):
                     if grounded:
                         jump = True
@@ -1112,3 +1112,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# rerun v36 fresh seeds
