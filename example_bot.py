@@ -910,7 +910,7 @@ class Bot:
             self.cover = None
             self.cover_off_until = tick + 60
         if len(contacts) >= 2 and not urgent_zone and tick >= self.cover_off_until:
-            need = len(seers) >= 2
+            need = len(seers) >= 2 or (len(seers) >= 1 and len(contacts) >= 3)
             cdist = hyp(self.cover[0], self.cover[1], x, y) if self.cover is not None else 999.0
             if need and (self.cover is None or tick - self.cover_tick >= 10):
                 if (time.perf_counter() - t0) < 0.018:
@@ -1240,4 +1240,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# v40 peek fighter: hide when 2+ enemies see us, fight one at a time from cover
+# v41 peek fighter, hides early when 3+ enemies are near
