@@ -1,4 +1,4 @@
-"""v10 Anti-Swarm Ground/Canopy Stealth, Laser-Charge Dodge & Endgame Rooftop Closer."""
+"""v10 3-Phase Grandmaster AI: Early Radio-Silence Ghost, 270-Deg Radar, Regen Discipline & Endgame Roof Laser."""
 import json
 import math
 import os
@@ -169,7 +169,8 @@ class Bot:
 
     def _choose_upgrade(self, offer: dict) -> int:
         choices = offer.get("choices", [])
-        priority = ["armor", "regen", "hp", "laser", "lightning", "gun_rate", "speed", "energy", "sensors"]
+        # Survival & mobility first, then weapon burst
+        priority = ["armor", "regen", "hp", "speed", "energy", "laser", "lightning", "gun_rate", "sensors"]
         best_idx, best_score = 0, -1
         for idx, c in enumerate(choices):
             cid = c.get("id", "").lower()
@@ -186,19 +187,19 @@ class Bot:
     def _weapon_rank(self, kind: str) -> int:
         return {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}.get(kind, 0)
 
-    def _pick_anchor(self, x: float, y: float, z: float, zone: dict, alive: int, cubes: int) -> tuple:
+    def _pick_anchor(self, x: float, y: float, z: float, zone: dict, alive: int) -> tuple:
         ncx, ncy = zone["next_center"]
         nrad = zone["next_radius"]
         max_r = max(14.0, nrad * 0.85)
 
-        # Stay on occluded ground cover until final 4 mechs so 15-bot hive-mind cannot crossfire us
-        if alive > 4 and self.arena.cover_spots:
+        # Phase 1 & 2 (alive > 5): Stay on ground cover occluded from zone center so 15 bots fight each other
+        if alive > 5 and self.arena.cover_spots:
             nearby = []
             for sx, sy in self.arena.cover_spots:
                 d_next = math.hypot(sx - ncx, sy - ncy)
                 if d_next <= max_r:
                     d_me = math.hypot(sx - x, sy - y)
-                    if d_me <= 175.0:
+                    if d_me <= 180.0:
                         nearby.append((d_me, d_next, sx, sy))
             nearby.sort(key=lambda item: item[0])
             best = None
@@ -207,16 +208,16 @@ class Bot:
                 gz = self.arena.ground_z(sx, sy)
                 if self.arena.is_blocked(sx, sy, gz, pad=2.2):
                     continue
-                score = -d_me * 0.65 + (50.0 if d_next >= nrad * 0.42 else 0.0)
+                score = -d_me * 0.65 + (55.0 if d_next >= nrad * 0.45 else 0.0)
                 if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
-                    score += 90.0
+                    score += 95.0
                 if score > best_score:
                     best_score = score
                     best = (sx, sy, gz)
             if best is not None:
                 return best
 
-        # Endgame (alive <= 4): seize outer-ring rooftop high ground
+        # Phase 3 (alive <= 5): Seize high-ground rooftop inside next safe zone for endgame execution
         best = None
         best_score = -1e9
         for rx, ry, rtop in self.arena.rooftops:
@@ -226,7 +227,7 @@ class Bot:
             d_me = math.hypot(rx - x, ry - y)
             if d_me > 185.0:
                 continue
-            score = -d_me * 0.65 + min(34.0, rtop) * 1.5
+            score = -d_me * 0.65 + min(36.0, rtop) * 1.5
             if nrad * 0.35 <= d_next <= max_r:
                 score += 55.0
             if score > best_score:
@@ -294,6 +295,7 @@ class Bot:
         if mechs:
             self.spotted_until_tick = max(self.spotted_until_tick, tick + 55)
 
+        # Free weapon pickup & upgrade swap
         w0, w1 = me["weapons"][0], me["weapons"][1]
         best_pickup = None
         for p in obs.get("pickups", []):
@@ -328,12 +330,12 @@ class Bot:
 
         if (self.anchor is None or tick - self.anchor_tick > 55 or
                 math.hypot(self.anchor[0] - ncx, self.anchor[1] - ncy) > nrad * 0.88):
-            self.anchor = self._pick_anchor(x, y, z, zone, alive, cubes)
+            self.anchor = self._pick_anchor(x, y, z, zone, alive)
             self.anchor_tick = tick
 
         goal_x, goal_y, goal_z = self.anchor
 
-        # Farm cubes strictly up to stat_cap (10)
+        # Silent scavenging: grab free floor cubes (up to 10) & floor weapons when no enemies are near
         farming_loot = False
         if not urgent_zone and not mechs and hp_frac > 0.55:
             if cubes < self.cube_cap:
@@ -367,9 +369,11 @@ class Bot:
         want_boost = False
         want_jump = False
 
-        # Detect any enemy charging a 315-dmg hitscan laser at us
         enemy_charging = next((m for m in mechs if m.get("charging")), None)
         incoming = [pr for pr in obs.get("projectiles", []) if math.dist(pr["pos"][:2], (x, y)) < 38.0]
+
+        # Phase 2 regen discipline: disengage to heal 45 HP/s when wounded & lobby > 3
+        need_regen = (hp_frac < 0.65) and (alive > 3)
 
         if enemy_charging is not None:
             ex, ey, _ = enemy_charging["pos"]
@@ -394,12 +398,13 @@ class Bot:
             away_yaw = math.atan2(y - ey, x - ex)
             strafe_yaw = away_yaw + self.strafe_dir * (math.pi * 0.46)
 
-            if hp_frac < 0.55 or len(mechs) >= 2:
+            if need_regen or len(mechs) >= 2 or alive > 7:
+                # Kite away toward building cover so we break LOS and let other bots fight each other
                 move_yaw = math.atan2(
                     0.65 * math.sin(away_yaw) + 0.35 * math.sin(move_yaw),
                     0.65 * math.cos(away_yaw) + 0.35 * math.cos(move_yaw),
                 )
-                want_boost = bool(hp_frac < 0.42 and energy > 25.0)
+                want_boost = bool((hp_frac < 0.45 or edist < 45.0) and energy > 25.0)
             elif z > ez + 5.0 and dist_goal < 14.0:
                 move_yaw = strafe_yaw
                 speed_scale = 0.8
@@ -413,6 +418,7 @@ class Bot:
             if dist_goal < 3.5 and abs(z - goal_z) < 2.0:
                 speed_scale = 0.0
             elif tick > self.spotted_until_tick and not farming_loot:
+                # Silent movement (<5.0 m/s) when unspotted
                 walk_spd = me.get("stats", {}).get("walk_speed", 11.7)
                 speed_scale = min(1.0, (self.step_speed * 0.88) / max(1.0, walk_spd))
 
@@ -447,6 +453,7 @@ class Bot:
         act["boost"] = bool(want_boost)
         act["jump"] = bool(want_jump)
 
+        # Phase-Aware Combat & 270-Degree Torso Radar Scan
         muzzle_z = z + me.get("stats", {}).get("muzzle_height", 7.0)
         fire = [False, False]
         has_mortar = any(w and w["kind"] == "mortar" for w in me["weapons"])
@@ -457,6 +464,15 @@ class Bot:
         ]
         occluded_mechs = [m for m in mechs if m not in clear_mechs] if has_mortar else []
 
+        # Early radio silence (alive > 7): only fire if enemy is close (<65m) or already shooting at us
+        radio_silence = (alive > 7) and (tick > self.spotted_until_tick) and (
+            not clear_mechs or math.dist(clear_mechs[0]["pos"][:2], (x, y)) > 65.0
+        )
+        # Regen discipline: hold fire if hurt and trying to trigger 5s passive regen (unless enemy <45m)
+        hold_for_regen = need_regen and (
+            not clear_mechs or math.dist(clear_mechs[0]["pos"][:2], (x, y)) > 45.0
+        )
+
         target_obj = None
         target_is_mech = False
         target_is_occluded = False
@@ -464,7 +480,7 @@ class Bot:
         target_vel = [0.0, 0.0, 0.0]
         target_h = 4.5
 
-        if clear_mechs:
+        if clear_mechs and not radio_silence and not hold_for_regen:
             def target_score(m):
                 d = math.dist(m["pos"], me["pos"])
                 hp = m.get("hp", 1000)
@@ -479,25 +495,18 @@ class Bot:
             target_pos = target_obj["pos"]
             target_vel = target_obj.get("vel", [0.0, 0.0, 0.0])
             target_h = 4.5
-        elif occluded_mechs and math.dist(occluded_mechs[0]["pos"][:2], (x, y)) <= 190.0:
+        elif occluded_mechs and alive <= 7 and not hold_for_regen and math.dist(occluded_mechs[0]["pos"][:2], (x, y)) <= 190.0:
             target_obj = occluded_mechs[0]
             target_is_mech = True
             target_is_occluded = True
             target_pos = target_obj["pos"]
             target_vel = target_obj.get("vel", [0.0, 0.0, 0.0])
             target_h = 2.0
-        elif not mechs and npcs and cubes < self.cube_cap and hp_frac > 0.60 and math.dist(npcs[0]["pos"][:2], (x, y)) < 55.0:
+        elif alive <= 7 and not mechs and not hold_for_regen and npcs and cubes < self.cube_cap and hp_frac > 0.65 and math.dist(npcs[0]["pos"][:2], (x, y)) < 50.0:
             if self.arena.has_clear_shot(x, y, muzzle_z, npcs[0]["pos"][0], npcs[0]["pos"][1], npcs[0]["pos"][2] + 1.8):
                 target_pos = npcs[0]["pos"]
                 target_vel = npcs[0].get("vel", [0.0, 0.0, 0.0])
                 target_h = 1.8
-        elif not mechs and obs.get("crates") and cubes < self.cube_cap and hp_frac > 0.65:
-            crates = sorted(obs["crates"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
-            if math.dist(crates[0]["pos"][:2], (x, y)) < 40.0:
-                if self.arena.has_clear_shot(x, y, muzzle_z, crates[0]["pos"][0], crates[0]["pos"][1], crates[0]["pos"][2] + 1.2):
-                    target_pos = crates[0]["pos"]
-                    target_vel = [0.0, 0.0, 0.0]
-                    target_h = 1.2
 
         if target_pos is not None:
             tx, ty, tz = target_pos
@@ -554,19 +563,21 @@ class Bot:
 
             mf.draw.line([x, y, muzzle_z], [lead_x, lead_y, lead_z], "#ff5040")
         else:
+            # Keep 180-deg front armor toward visible threat, otherwise sweep 270-deg radar!
             if mechs:
                 act["aim"] = [math.atan2(mechs[0]["pos"][1] - y, mechs[0]["pos"][0] - x), 0.0]
-            elif tick - self.last_threat_tick < 60 and self.last_threat_yaw is not None:
+            elif tick - self.last_threat_tick < 50 and self.last_threat_yaw is not None:
                 act["aim"] = [self.last_threat_yaw, 0.0]
             else:
-                act["aim"] = [wrap_angle(me["aim"][0] + 0.32), 0.0]
+                scan_offset = 1.30 * math.sin(tick * 0.26)
+                act["aim"] = [wrap_angle(move_yaw + scan_offset), 0.0]
 
             if w0 and w0["kind"] == "gun" and w0.get("ammo", 12) < w0.get("stats", {}).get("mag", 12):
                 act["reload"] = True
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v10 | Z:{z:.0f} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v10 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
