@@ -1,5 +1,4 @@
-"""v24 Exact OSU Map Geometry (Stadium Tunnels + Hole-Free Roofs), Fast Cached A* & v17+ Cover-Peek Combat."""
-import heapq
+"""v25 Built on v17 (3.77) Core: High-Altitude Fortress Rooftops (22-48m) & Full-Tank Climb."""
 import json
 import math
 import os
@@ -44,22 +43,13 @@ class ArenaMap:
     def __init__(self, map_dir: str):
         self.prisms = []
         self.rooftops = []
-        self.cover_nodes = []
-        self.stadium_gates = []
+        self.cover_spots = []
         self.terrain = None
         self.nx = 0
         self.ny = 0
         self.min_x = -513.0
         self.min_y = -334.0
         self.step = 1.0
-
-        # Exact map bounds from world.json: x in [-513, 556], y in [-334, 389]
-        self.g_step = 18.0
-        self.g_min_x = -510.0
-        self.g_min_y = -330.0
-        self.g_nx = 61
-        self.g_ny = 41
-        self.walkable = set()
 
         world_path = os.path.join(map_dir, "v2", "world.json")
         terr_path = os.path.join(map_dir, "v2", "terrain.i16")
@@ -81,13 +71,9 @@ class ArenaMap:
                 if len(raw) >= count * 2:
                     self.terrain = struct.unpack(f"<{count}h", raw[: count * 2])
 
-            for op in w.get("stadium", {}).get("openings", []):
-                if "x" in op and "y" in op:
-                    self.stadium_gates.append((float(op["x"]), float(op["y"])))
-
             for p in w.get("prisms", []):
                 ring = p.get("ring", [])
-                if len(ring) < 6 or poly_area(ring) < 12.0:
+                if len(ring) < 6 or poly_area(ring) < 15.0:
                     continue
                 xs = ring[0::2]
                 ys = ring[1::2]
@@ -97,7 +83,6 @@ class ArenaMap:
                 cx, cy = (minx + maxx) * 0.5, (miny + maxy) * 0.5
                 holes = p.get("holes", [])
                 prism = {
-                    "kind": p.get("kind", "building"),
                     "base": base,
                     "top": top,
                     "ring": ring,
@@ -106,104 +91,27 @@ class ArenaMap:
                     "center": (cx, cy),
                 }
                 self.prisms.append(prism)
-
                 gz_c = self.ground_z(cx, cy)
                 climb_h = top - gz_c
-                # Fast-climb roofs (8m-20m above local terrain) verified free of holes and taller overlapping towers
-                if 8.0 <= climb_h <= 20.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
+                # Climbable campus roofs up to 48m (within 100-energy 60m max climb)
+                if 10.0 <= climb_h <= 48.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                     if point_in_poly(cx, cy, ring) and not any(point_in_poly(cx, cy, h) for h in holes):
                         self.rooftops.append((cx, cy, top, climb_h))
-
-                if (top - base) >= 10.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
+                if (top - base) >= 12.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                     for idx in range(0, len(ring), 4):
                         vx, vy = ring[idx], ring[idx + 1]
                         dx, dy = vx - cx, vy - cy
                         d = math.hypot(dx, dy)
                         if d > 1.0:
-                            self.cover_nodes.append((vx + (dx / d) * 4.8, vy + (dy / d) * 4.8))
+                            self.cover_spots.append((vx + (dx / d) * 4.5, vy + (dy / d) * 4.5))
 
-            # Filter out roof points that sit inside another taller prism (multi-tier buildings)
             clean_roofs = []
             for rx, ry, rtop, ch in self.rooftops:
                 if not self.is_blocked(rx, ry, rtop + 0.5, pad=2.0):
                     clean_roofs.append((rx, ry, rtop, ch))
             self.rooftops = clean_roofs
-
-            self._build_nav_grid()
         except Exception as e:
             mf.log(f"Map load warning: {e}")
-
-    def _build_nav_grid(self):
-        for gx in range(self.g_nx):
-            wx = self.g_min_x + gx * self.g_step
-            for gy in range(self.g_ny):
-                wy = self.g_min_y + gy * self.g_step
-                gz = self.ground_z(wx, wy)
-                if not self.is_blocked(wx, wy, gz, pad=2.8):
-                    self.walkable.add((gx, gy))
-        for gx_w, gy_w in self.stadium_gates:
-            cx, cy = self._to_grid(gx_w, gy_w)
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    self.walkable.add((cx + dx, cy + dy))
-
-    def _to_grid(self, x: float, y: float) -> tuple:
-        gx = max(0, min(self.g_nx - 1, int(round((x - self.g_min_x) / self.g_step))))
-        gy = max(0, min(self.g_ny - 1, int(round((y - self.g_min_y) / self.g_step))))
-        return (gx, gy)
-
-    def _to_world(self, gx: int, gy: int) -> tuple:
-        return (self.g_min_x + gx * self.g_step, self.g_min_y + gy * self.g_step)
-
-    def _nearest_walkable(self, cell: tuple) -> tuple:
-        if cell in self.walkable:
-            return cell
-        cx, cy = cell
-        for r in range(1, 5):
-            for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
-                    nc = (cx + dx, cy + dy)
-                    if nc in self.walkable:
-                        return nc
-        return cell
-
-    def next_waypoint(self, sx: float, sy: float, tx: float, ty: float) -> tuple:
-        if math.hypot(tx - sx, ty - sy) < 26.0:
-            return (tx, ty)
-        start = self._nearest_walkable(self._to_grid(sx, sy))
-        goal = self._nearest_walkable(self._to_grid(tx, ty))
-        if start == goal:
-            return (tx, ty)
-
-        pq = [(math.hypot(goal[0] - start[0], goal[1] - start[1]), 0.0, start)]
-        came_from = {}
-        g_score = {start: 0.0}
-        visited = 0
-
-        while pq and visited < 220:
-            _, cost, curr = heapq.heappop(pq)
-            visited += 1
-            if curr == goal:
-                while curr in came_from and came_from[curr] != start:
-                    curr = came_from[curr]
-                return self._to_world(curr[0], curr[1])
-
-            cx, cy = curr
-            for dx, dy, step_c in (
-                (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
-                (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414),
-            ):
-                nxt = (cx + dx, cy + dy)
-                if nxt not in self.walkable:
-                    continue
-                nc = cost + step_c
-                if nc < g_score.get(nxt, 1e9):
-                    g_score[nxt] = nc
-                    came_from[nxt] = curr
-                    h = math.hypot(goal[0] - nxt[0], goal[1] - nxt[1])
-                    heapq.heappush(pq, (nc + h, nc, nxt))
-
-        return (tx, ty)
 
     def ground_z(self, x: float, y: float) -> float:
         if not self.terrain:
@@ -221,7 +129,7 @@ class ArenaMap:
         return (z00 * (1 - dx) * (1 - dy) + z10 * dx * (1 - dy) +
                 z01 * (1 - dx) * dy + z11 * dx * dy) * 0.01
 
-    def blocking_prism(self, x: float, y: float, z: float, pad: float = 2.7):
+    def blocking_prism(self, x: float, y: float, z: float, pad: float = 2.8):
         for p in self.prisms:
             minx, miny, maxx, maxy = p["bbox"]
             if x < minx - pad or x > maxx + pad or y < miny - pad or y > maxy + pad:
@@ -283,9 +191,6 @@ class Bot:
         self.strafe_dir = 1.0
         self.anchor = None
         self.anchor_tick = -999
-        self.cached_wp = None
-        self.cached_wp_tick = -999
-        self.cached_wp_goal = None
 
         self.upgrade_weights = {
             "armor": 100,
@@ -323,7 +228,7 @@ class Bot:
     def _weapon_rank(self, kind: str) -> int:
         return {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}.get(kind, 0)
 
-    def _pick_anchor(self, x: float, y: float, z: float, zone: dict, alive: int) -> tuple:
+    def _pick_anchor(self, x: float, y: float, z: float, zone: dict, alive: int, cubes: int) -> tuple:
         ncx, ncy = zone["next_center"]
         nrad = zone["next_radius"]
         max_r = max(14.0, nrad * 0.86)
@@ -336,20 +241,21 @@ class Bot:
             if d_next > max_r:
                 continue
             d_me = math.hypot(rx - x, ry - y)
-            if d_me > 190.0:
+            if d_me > 195.0:
                 continue
-            score = -d_me * 0.58 + (22.0 - abs(h - 13.5)) * 1.6
-            if nrad * 0.40 <= d_next <= max_r:
+            # Strongly reward high 22-45m fortress roofs where ground bots can't easily jump-swarm!
+            score = -d_me * 0.55 + min(42.0, h) * 2.1
+            if nrad * 0.35 <= d_next <= max_r:
                 score += 65.0
-            if alive <= 6:
-                score += 35.0
+            if alive <= 7:
+                score += 40.0
             if score > best_score:
                 best_score = score
                 best = (rx, ry, rtop)
 
-        if alive > 5 and self.arena.cover_nodes:
+        if alive > 6 and self.arena.cover_spots:
             nearby = []
-            for sx, sy in self.arena.cover_nodes:
+            for sx, sy in self.arena.cover_spots:
                 d_next = math.hypot(sx - ncx, sy - ncy)
                 if d_next <= max_r:
                     d_me = math.hypot(sx - x, sy - y)
@@ -358,10 +264,10 @@ class Bot:
             nearby.sort(key=lambda item: item[0])
             for d_me, d_next, sx, sy in nearby[:14]:
                 gz = self.arena.ground_z(sx, sy)
-                if self.arena.is_blocked(sx, sy, gz, pad=2.5):
+                if self.arena.is_blocked(sx, sy, gz, pad=2.4):
                     continue
                 if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
-                    score = -d_me * 0.60 + 84.0 + (45.0 if d_next >= nrad * 0.45 else 0.0)
+                    score = -d_me * 0.60 + 78.0 + (45.0 if d_next >= nrad * 0.45 else 0.0)
                     if score > best_score:
                         best_score = score
                         best = (sx, sy, gz)
@@ -370,30 +276,6 @@ class Bot:
             return best
         ang = math.atan2(y - ncy, x - ncx)
         return (ncx + math.cos(ang) * (max_r * 0.72), ncy + math.sin(ang) * (max_r * 0.72), 0.0)
-
-    def _find_peek_cover(self, x: float, y: float, z: float, ex: float, ey: float, ez: float) -> tuple:
-        best = None
-        best_d = 46.0
-        for sx, sy in self.arena.cover_nodes:
-            d = math.hypot(sx - x, sy - y)
-            if d < best_d:
-                gz = self.arena.ground_z(sx, sy)
-                if abs(gz - z) <= 5.5 and not self.arena.is_blocked(sx, sy, gz, pad=2.4):
-                    if not self.arena.has_clear_shot(sx, sy, gz + 6.5, ex, ey, ez + 4.5):
-                        best_d = d
-                        best = (sx, sy)
-        return best
-
-    def _get_waypoint(self, tick: int, x: float, y: float, gx: float, gy: float) -> tuple:
-        if math.hypot(gx - x, gy - y) < 28.0:
-            return (gx, gy)
-        if (self.cached_wp is not None and tick - self.cached_wp_tick < 12 and
-                self.cached_wp_goal is not None and math.hypot(gx - self.cached_wp_goal[0], gy - self.cached_wp_goal[1]) < 15.0):
-            return self.cached_wp
-        self.cached_wp = self.arena.next_waypoint(x, y, gx, gy)
-        self.cached_wp_tick = tick
-        self.cached_wp_goal = (gx, gy)
-        return self.cached_wp
 
     def _mortar_pitch(self, dist: float, dz: float, speed: float) -> float:
         g = self.mortar_g
@@ -404,29 +286,9 @@ class Bot:
         tan_theta = (v2 - math.sqrt(disc)) / max(1.0, g * dist)
         return math.atan(tan_theta)
 
-    def _evade_projectiles(self, x: float, y: float, z: float, projectiles: list) -> float:
-        for pr in projectiles:
-            px, py, pz = pr["pos"]
-            vx, vy, vz = pr["vel"]
-            spd = math.hypot(vx, vy)
-            if spd < 10.0:
-                continue
-            dx, dy = x - px, y - py
-            t_closest = max(0.0, min(0.60, (dx * vx + dy * vy) / (spd * spd)))
-            cx = px + vx * t_closest
-            cy = py + vy * t_closest
-            cz = pz + vz * t_closest - (0.5 * self.mortar_g * t_closest * t_closest if pr["kind"] == "mortar" else 0.0)
-            miss_xy = math.hypot(x - cx, y - cy)
-            danger_r = 9.0 if pr["kind"] == "mortar" else 4.8
-            if miss_xy < danger_r and -2.0 <= (cz - z) <= 11.0:
-                p_yaw = math.atan2(vy, vx)
-                side = 1.0 if ((x - cx) * (-vy) + (y - cy) * vx) >= 0.0 else -1.0
-                return wrap_angle(p_yaw + side * (math.pi * 0.5))
-        return None
-
     def act(self, obs: mf.Observation) -> mf.Action:
-        tick = int(obs["tick"])
-        t = float(obs["t"])
+        tick = obs["tick"]
+        t = obs["t"]
         me = obs["self"]
         x, y, z = me["pos"]
         hp_frac = me["hp"] / max(1.0, me["max_hp"])
@@ -480,10 +342,10 @@ class Bot:
 
         if best_pickup:
             if w1 is None:
-                act["take"] = int(best_pickup["id"])
+                act["take"] = best_pickup["id"]
             elif self._weapon_rank(best_pickup["kind"]) > self._weapon_rank(w1["kind"]):
                 if not (w1["kind"] == "laser" and w1.get("charge", 0) > 0):
-                    act["take"] = int(best_pickup["id"])
+                    act["take"] = best_pickup["id"]
                     act["drop"] = 1
 
         zone = obs["zone"]
@@ -498,7 +360,7 @@ class Bot:
 
         if (self.anchor is None or tick - self.anchor_tick > 55 or
                 math.hypot(self.anchor[0] - ncx, self.anchor[1] - ncy) > nrad * 0.88):
-            self.anchor = self._pick_anchor(x, y, z, zone, alive)
+            self.anchor = self._pick_anchor(x, y, z, zone, alive, cubes)
             self.anchor_tick = tick
 
         goal_x, goal_y, goal_z = self.anchor
@@ -535,32 +397,32 @@ class Bot:
         avoid_cube = None
         if cubes >= self.cube_cap and not capturing_drop:
             for c in obs.get("cubes", []):
-                if math.dist(c["pos"][:2], (x, y)) < 7.0 and abs(c["pos"][2] - z) < 4.0:
+                if math.dist(c["pos"][:2], (x, y)) < 6.0 and abs(c["pos"][2] - z) < 4.0:
                     avoid_cube = c["pos"]
                     break
 
-        nav_x, nav_y = self._get_waypoint(tick, x, y, goal_x, goal_y) if grounded else (goal_x, goal_y)
         dist_goal = math.hypot(goal_x - x, goal_y - y)
-        move_yaw = math.atan2(nav_y - y, nav_x - x)
+        move_yaw = math.atan2(goal_y - y, goal_x - x)
         speed_scale = 1.0
         want_boost = False
         want_jump = False
         micro_weaving = False
 
         enemy_charging = next((m for m in mechs if m.get("charging")), None)
-        evade_yaw = self._evade_projectiles(x, y, z, obs.get("projectiles", []))
+        incoming = [pr for pr in obs.get("projectiles", []) if math.dist(pr["pos"][:2], (x, y)) < 36.0]
 
         if enemy_charging is not None:
             ex, ey, _ = enemy_charging["pos"]
             to_me = math.atan2(y - ey, x - ex)
             move_yaw = wrap_angle(to_me + self.strafe_dir * (math.pi * 0.5))
             want_boost = bool(energy > 25.0)
-        elif evade_yaw is not None:
-            move_yaw = evade_yaw
-            want_boost = bool(energy > 30.0)
+        elif incoming:
+            pr = incoming[0]
+            p_yaw = math.atan2(pr["vel"][1], pr["vel"][0])
+            move_yaw = wrap_angle(p_yaw + self.strafe_dir * (math.pi * 0.5))
+            want_boost = bool(energy > 35.0)
         elif urgent_zone:
-            zx, zy = self._get_waypoint(tick, x, y, ncx, ncy) if grounded else (ncx, ncy)
-            move_yaw = math.atan2(zy - y, zx - x)
+            move_yaw = math.atan2(ncy - y, ncx - x)
             want_boost = bool((not in_zone) and energy > 20.0)
         elif avoid_cube is not None:
             move_yaw = math.atan2(y - avoid_cube[1], x - avoid_cube[0])
@@ -573,14 +435,10 @@ class Bot:
             strafe_yaw = away_yaw + self.strafe_dir * (math.pi * 0.46)
 
             if hp_frac < 0.50 or len(mechs) >= 2:
-                cover_pt = self._find_peek_cover(x, y, z, ex, ey, ez)
-                if cover_pt is not None:
-                    move_yaw = math.atan2(cover_pt[1] - y, cover_pt[0] - x)
-                else:
-                    move_yaw = math.atan2(
-                        0.65 * math.sin(away_yaw) + 0.35 * math.sin(move_yaw),
-                        0.65 * math.cos(away_yaw) + 0.35 * math.cos(move_yaw),
-                    )
+                move_yaw = math.atan2(
+                    0.65 * math.sin(away_yaw) + 0.35 * math.sin(move_yaw),
+                    0.65 * math.cos(away_yaw) + 0.35 * math.cos(move_yaw),
+                )
                 want_boost = bool(hp_frac < 0.40 and energy > 25.0)
             elif z > ez + 5.0 and dist_goal < 14.0:
                 if dist_goal > 5.5:
@@ -605,13 +463,15 @@ class Bot:
                 speed_scale = min(0.42, (self.step_speed * 0.86) / max(1.0, walk_spd))
                 micro_weaving = True
 
+        # Full-tank wall-edge pre-jump for 10m-48m fortress rooftops
         if speed_scale > 0.05 and not micro_weaving:
             probe_x = x + math.cos(move_yaw) * 5.0
             probe_y = y + math.sin(move_yaw) * 5.0
             wall = self.arena.blocking_prism(probe_x, probe_y, z, pad=2.8)
             if wall is not None:
                 wall_h = wall["top"] - z
-                if wall_h <= 20.5 and ((not grounded and energy > 10.0) or (grounded and energy >= 38.0)):
+                req_energy = 72.0 if wall_h > 22.0 else 38.0
+                if wall_h <= 48.5 and ((not grounded and energy > 8.0) or (grounded and energy >= req_energy)):
                     if grounded:
                         want_jump = True
                     want_boost = True
@@ -622,7 +482,7 @@ class Bot:
                             move_yaw = alt
                             break
 
-        if not grounded and goal_z > z + 0.5 and dist_goal < 28.0 and energy > 10.0:
+        if not grounded and goal_z > z + 0.5 and dist_goal < 32.0 and energy > 8.0:
             want_boost = True
 
         if self.stuck_ticks >= 4 and speed_scale > 0.05 and not micro_weaving:
@@ -769,7 +629,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v24 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v25 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
