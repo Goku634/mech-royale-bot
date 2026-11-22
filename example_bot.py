@@ -1,4 +1,4 @@
-"""v14 Telemetry-Driven AI: Fast Low-Roof Climbs (10-24m), Outer-Flank Opening & Supply Drop Capture."""
+"""v15 Wall-Edge Pre-Jump Rooftop Physics, Building-Shadow Cover & 75m Loot Snowball."""
 import json
 import math
 import os
@@ -31,6 +31,7 @@ class ArenaMap:
     def __init__(self, map_dir: str):
         self.prisms = []
         self.rooftops = []
+        self.cover_spots = []
         self.terrain = None
         self.nx = 0
         self.ny = 0
@@ -62,10 +63,18 @@ class ArenaMap:
                     }
                     self.prisms.append(prism)
                     height = top - base
-                    # Fast-climb roofs (10m-25m): clear in <1.4s with 60+ energy left!
-                    if 10.0 <= height <= 25.0 and (maxx - minx) >= 15.0 and (maxy - miny) >= 15.0:
+                    # Fast-climb roofs (9m-18m): take ~1.1s & ~18 energy to clear cleanly
+                    if 9.0 <= height <= 18.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                         if point_in_poly(cx, cy, ring) and not any(point_in_poly(cx, cy, h) for h in p.get("holes", [])):
                             self.rooftops.append((cx, cy, top, height))
+                    # Tall buildings (>=12m) provide 360-deg visual shields on ground corners
+                    if height >= 12.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
+                        for idx in range(0, len(ring), 4):
+                            vx, vy = ring[idx], ring[idx + 1]
+                            dx, dy = vx - cx, vy - cy
+                            d = math.hypot(dx, dy)
+                            if d > 1.0:
+                                self.cover_spots.append((vx + (dx / d) * 4.5, vy + (dy / d) * 4.5))
 
             t_meta = w.get("terrain", {})
             self.nx = int(t_meta.get("nx", 0))
@@ -83,7 +92,23 @@ class ArenaMap:
         except Exception as e:
             mf.log(f"Map load warning: {e}")
 
-    def is_blocked(self, x: float, y: float, z: float, pad: float = 2.6) -> bool:
+    def ground_z(self, x: float, y: float) -> float:
+        if not self.terrain:
+            return 0.0
+        fx = max(0.0, min(self.nx - 1.001, (x - self.min_x) / self.step))
+        fy = max(0.0, min(self.ny - 1.001, (y - self.min_y) / self.step))
+        i, j = int(fx), int(fy)
+        dx, dy = fx - i, fy - j
+        row0 = j * self.nx
+        row1 = (j + 1) * self.nx
+        z00 = self.terrain[row0 + i]
+        z10 = self.terrain[row0 + i + 1]
+        z01 = self.terrain[row1 + i]
+        z11 = self.terrain[row1 + i + 1]
+        return (z00 * (1 - dx) * (1 - dy) + z10 * dx * (1 - dy) +
+                z01 * (1 - dx) * dy + z11 * dx * dy) * 0.01
+
+    def blocking_prism(self, x: float, y: float, z: float, pad: float = 2.8):
         for p in self.prisms:
             minx, miny, maxx, maxy = p["bbox"]
             if x < minx - pad or x > maxx + pad or y < miny - pad or y > maxy + pad:
@@ -92,8 +117,11 @@ class ArenaMap:
                 continue
             if point_in_poly(x, y, p["ring"]):
                 if not any(point_in_poly(x, y, h) for h in p["holes"]):
-                    return True
-        return False
+                    return p
+        return None
+
+    def is_blocked(self, x: float, y: float, z: float, pad: float = 2.6) -> bool:
+        return self.blocking_prism(x, y, z, pad) is not None
 
     def has_clear_shot(self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float) -> bool:
         min_sx, max_sx = (x1, x2) if x1 < x2 else (x2, x1)
@@ -129,6 +157,7 @@ class Bot:
     def __init__(self, hello: mf.Hello):
         cfg = hello.get("config", {})
         self.reach = float(cfg.get("loot", {}).get("pickup_radius", 4.0))
+        self.step_speed = float(cfg.get("sound", {}).get("step_speed", 5.0))
         self.cube_cap = int(cfg.get("cubes", {}).get("stat_cap", 10))
         self.mortar_g = float(cfg.get("weapons", {}).get("mortar", {}).get("gravity", 22.0))
         map_dir = hello.get("map", {}).get("dir", "/arena")
@@ -178,29 +207,50 @@ class Bot:
     def _weapon_rank(self, kind: str) -> int:
         return {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}.get(kind, 0)
 
-    def _pick_rooftop(self, x: float, y: float, z: float, zone: dict, t: float) -> tuple:
+    def _pick_anchor(self, x: float, y: float, z: float, zone: dict, alive: int, cubes: int) -> tuple:
         ncx, ncy = zone["next_center"]
         nrad = zone["next_radius"]
         max_r = max(14.0, nrad * 0.86)
-        # During first 38s, stay in outer flank ring (0.50-0.86 nrad) to avoid center spawn bloodbath
-        min_ring = nrad * (0.50 if t < 38.0 else 0.30)
 
+        # Combine fast-climb rooftops (9-18m) AND building-shadow ground cover into one unified tactical score
         best = None
         best_score = -1e9
+
         for rx, ry, rtop, h in self.arena.rooftops:
             d_next = math.hypot(rx - ncx, ry - ncy)
             if d_next > max_r:
                 continue
             d_me = math.hypot(rx - x, ry - y)
-            if d_me > 190.0:
+            if d_me > 185.0:
                 continue
-            # Prefer fast-climb 12-20m roofs so we never stall mid-air
-            score = -d_me * 0.65 + (24.0 - abs(h - 16.0)) * 1.4
-            if min_ring <= d_next <= max_r:
-                score += 60.0
+            score = -d_me * 0.60 + (22.0 - abs(h - 13.0)) * 1.6
+            if nrad * 0.42 <= d_next <= max_r:
+                score += 65.0
+            if alive <= 6:
+                score += 35.0
             if score > best_score:
                 best_score = score
                 best = (rx, ry, rtop)
+
+        if alive > 5 and self.arena.cover_spots:
+            nearby = []
+            for sx, sy in self.arena.cover_spots:
+                d_next = math.hypot(sx - ncx, sy - ncy)
+                if d_next <= max_r:
+                    d_me = math.hypot(sx - x, sy - y)
+                    if d_me <= 165.0:
+                        nearby.append((d_me, d_next, sx, sy))
+            nearby.sort(key=lambda item: item[0])
+            for d_me, d_next, sx, sy in nearby[:14]:
+                gz = self.arena.ground_z(sx, sy)
+                if self.arena.is_blocked(sx, sy, gz, pad=2.4):
+                    continue
+                # Only prefer ground cover if a tall building physically blocks LOS to the crowded zone center
+                if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
+                    score = -d_me * 0.60 + 82.0 + (45.0 if d_next >= nrad * 0.45 else 0.0)
+                    if score > best_score:
+                        best_score = score
+                        best = (sx, sy, gz)
 
         if best is not None:
             return best
@@ -292,28 +342,28 @@ class Bot:
 
         if (self.anchor is None or tick - self.anchor_tick > 55 or
                 math.hypot(self.anchor[0] - ncx, self.anchor[1] - ncy) > nrad * 0.88):
-            self.anchor = self._pick_rooftop(x, y, z, zone, t)
+            self.anchor = self._pick_anchor(x, y, z, zone, alive, cubes)
             self.anchor_tick = tick
 
         goal_x, goal_y, goal_z = self.anchor
 
-        # Check for uncontested Supply Drop (+3 cubes + full HP/energy heal!)
+        # Uncontested Supply Drop capture (+3 cubes + full heal)
         capturing_drop = False
         if not urgent_zone and len(mechs) <= 1 and (cubes < self.cube_cap or hp_frac < 0.70):
             for dr in obs.get("drops", []):
                 if dr.get("lands_in", 99.0) <= 10.0 and dr.get("holder") in (None, me["id"]):
-                    d_drop = math.dist(dr["pos"][:2], (x, y))
-                    if d_drop < 95.0:
+                    if math.dist(dr["pos"][:2], (x, y)) < 90.0:
                         goal_x, goal_y, goal_z = dr["pos"]
                         capturing_drop = True
                         break
 
+        # 75m opportunistic loot & special-weapon sweep when safe
         farming_loot = False
-        if not urgent_zone and not capturing_drop and not mechs and hp_frac > 0.55:
+        if not urgent_zone and not capturing_drop and not mechs and hp_frac > 0.52:
             if cubes < self.cube_cap:
                 near_cubes = [
                     c for c in obs.get("cubes", [])
-                    if math.dist(c["pos"][:2], (x, y)) < 52.0 and abs(c["pos"][2] - z) < 12.0
+                    if math.dist(c["pos"][:2], (x, y)) < 75.0 and abs(c["pos"][2] - z) < 14.0
                 ]
                 if near_cubes:
                     near_cubes.sort(key=lambda c: math.dist(c["pos"][:2], (x, y)))
@@ -322,7 +372,7 @@ class Bot:
             if not farming_loot:
                 near_weaps = [
                     p for p in obs.get("pickups", [])
-                    if math.dist(p["pos"][:2], (x, y)) < 42.0 and abs(p["pos"][2] - z) < 10.0 and self._weapon_rank(p["kind"]) >= 2
+                    if math.dist(p["pos"][:2], (x, y)) < 68.0 and abs(p["pos"][2] - z) < 12.0 and self._weapon_rank(p["kind"]) >= 2
                 ]
                 if near_weaps:
                     goal_x, goal_y, goal_z = near_weaps[0]["pos"]
@@ -386,27 +436,29 @@ class Bot:
             if dist_goal < 3.5 and abs(z - goal_z) < 2.0:
                 speed_scale = 0.0
 
-        # Fast-climb jetpack onto low/medium rooftops (only if we have >= 45 energy so we never stall mid-air!)
-        if not farming_loot and not capturing_drop and goal_z > z + 2.0 and dist_goal < 24.0:
-            if (not grounded and energy > 12.0) or (grounded and energy >= 48.0):
-                if grounded:
-                    want_jump = True
-                want_boost = True
-
-        if speed_scale > 0.05 and not want_boost:
-            probe_x = x + math.cos(move_yaw) * 4.5
-            probe_y = y + math.sin(move_yaw) * 4.5
-            if self.arena.is_blocked(probe_x, probe_y, z):
-                if dist_goal < 26.0 and goal_z > z + 2.0 and energy >= 45.0:
+        # Wall-Edge Pre-Jump Rooftop Physics: detect the building wall 5m ahead and jet cleanly over its lip!
+        if speed_scale > 0.05:
+            probe_x = x + math.cos(move_yaw) * 5.0
+            probe_y = y + math.sin(move_yaw) * 5.0
+            wall = self.arena.blocking_prism(probe_x, probe_y, z, pad=2.8)
+            if wall is not None:
+                wall_h = wall["top"] - z
+                # If this wall is our target roof (or a climbable <=18m building) and we have energy, jump BEFORE hitting the wall!
+                if wall_h <= 18.5 and ((not grounded and energy > 10.0) or (grounded and energy >= 38.0)):
                     if grounded:
                         want_jump = True
                     want_boost = True
                 else:
+                    # Steer cleanly around tall (>18.5m) buildings instead of wasting energy climbing them
                     for offset in (0.6, -0.6, 1.2, -1.2, 1.8, -1.8, 2.4):
                         alt = wrap_angle(move_yaw + offset)
-                        if not self.arena.is_blocked(x + math.cos(alt) * 5.0, y + math.sin(alt) * 5.0, z):
+                        if not self.arena.is_blocked(x + math.cos(alt) * 5.5, y + math.sin(alt) * 5.5, z):
                             move_yaw = alt
                             break
+
+        # Keep jetting upward until feet clear the roof lip (z >= goal_z - 0.5)
+        if not grounded and goal_z > z + 0.5 and dist_goal < 28.0 and energy > 10.0:
+            want_boost = True
 
         if self.stuck_ticks >= 4 and speed_scale > 0.05:
             move_yaw = wrap_angle(move_yaw + (1.4 if (tick // 8) % 2 == 0 else -1.4))
@@ -543,7 +595,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v14 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v15 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
