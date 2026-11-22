@@ -1,4 +1,4 @@
-"""v32 Built on v31 (3.96): Progressive Laser Release, Anti-2v1 Flee Boost & 15-Cube 5th Upgrade Tier."""
+"""v33 Built on v31 (3.96): 2.5m-Radius Nav, Jetpack Escape, Pre-Snap Laser + 3D Lead, Nanite Regen Discipline."""
 import json
 import math
 import os
@@ -72,42 +72,13 @@ class ArenaMap:
     def _load(self, d):
         with open(os.path.join(d, "v2", "world.json"), "r") as f:
             w = json.load(f)
-        for p in w.get("prisms", []):
-            ring = p.get("ring") or []
-            if len(ring) < 6:
-                continue
-            xs = ring[0::2]
-            ys = ring[1::2]
-            minx, miny, maxx, maxy = min(xs), min(ys), max(xs), max(ys)
-            base = float(p.get("base", 0.0))
-            top = float(p.get("top", 0.0))
-            holes = p.get("holes") or []
-            prism = {"base": base, "top": top, "ring": ring, "holes": holes,
-                     "bbox": (minx, miny, maxx, maxy)}
-            idx = len(self.prisms)
-            self.prisms.append(prism)
-            for cx in range(self._cell(minx), self._cell(maxx) + 1):
-                for cy in range(self._cell(miny), self._cell(maxy) + 1):
-                    self.grid.setdefault((cx, cy), []).append(idx)
-            height = top - base
-            cx_, cy_ = (minx + maxx) * 0.5, (miny + maxy) * 0.5
-            big = (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0
-            if 9.0 <= height <= 18.0 and big and self.inside_prism(prism, cx_, cy_):
-                self.rooftops.append((cx_, cy_, top, height))
-            if height >= 12.0 and big:
-                for k in range(0, len(ring) - 1, 4):
-                    vx, vy = ring[k], ring[k + 1]
-                    dx, dy = vx - cx_, vy - cy_
-                    dd = math.hypot(dx, dy)
-                    if dd > 1.0:
-                        self.cover_spots.append((vx + dx / dd * 4.5, vy + dy / dd * 4.5))
         tm = w.get("terrain", {}) or {}
         self.nx = int(tm.get("nx", 0))
         self.ny = int(tm.get("ny", 0))
         self.min_x = float(tm.get("minX", 0.0))
         self.min_y = float(tm.get("minY", 0.0))
         self.step = float(tm.get("step", 1.0))
-        del w
+
         tp = os.path.join(d, "v2", "terrain.i16")
         if os.path.exists(tp) and self.nx > 0 and self.ny > 0:
             with open(tp, "rb") as f:
@@ -119,6 +90,47 @@ class ArenaMap:
                 if sys.byteorder == "big":
                     arr.byteswap()
                 self.terrain = arr
+
+        raw_roofs = []
+        for p in w.get("prisms", []):
+            ring = p.get("ring") or []
+            if len(ring) < 6:
+                continue
+            xs = ring[0::2]
+            ys = ring[1::2]
+            minx, miny, maxx, maxy = min(xs), min(ys), max(xs), max(ys)
+            if (maxx - minx) < 1.5 or (maxy - miny) < 1.5:
+                continue
+            base = float(p.get("base", 0.0))
+            top = float(p.get("top", 0.0))
+            holes = p.get("holes") or []
+            prism = {"base": base, "top": top, "ring": ring, "holes": holes,
+                     "bbox": (minx, miny, maxx, maxy)}
+            idx = len(self.prisms)
+            self.prisms.append(prism)
+            # Index with 3m margin so 2.5m-radius padded checks never miss a neighbor prism
+            for cx in range(self._cell(minx - 3.0), self._cell(maxx + 3.0) + 1):
+                for cy in range(self._cell(miny - 3.0), self._cell(maxy + 3.0) + 1):
+                    self.grid.setdefault((cx, cy), []).append(idx)
+            height = top - base
+            cx_, cy_ = (minx + maxx) * 0.5, (miny + maxy) * 0.5
+            big = (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0
+            gz_c = self.ground_z(cx_, cy_)
+            climb_h = top - gz_c
+            if 8.5 <= climb_h <= 24.0 and big and self.inside_prism(prism, cx_, cy_):
+                raw_roofs.append((cx_, cy_, top, climb_h))
+            if height >= 12.0 and big:
+                for k in range(0, len(ring) - 1, 4):
+                    vx, vy = ring[k], ring[k + 1]
+                    dx, dy = vx - cx_, vy - cy_
+                    dd = math.hypot(dx, dy)
+                    if dd > 1.0:
+                        self.cover_spots.append((vx + dx / dd * 4.8, vy + dy / dd * 4.8))
+        del w
+        # Filter out roof centers buried inside taller upper tiers of multi-tier buildings
+        for rx, ry, rtop, ch in raw_roofs:
+            if self.blocking_prism(rx, ry, rtop + 0.4, pad=2.0) is None:
+                self.rooftops.append((rx, ry, rtop, ch))
 
     def inside_prism(self, p, x, y):
         minx, miny, maxx, maxy = p["bbox"]
@@ -144,23 +156,30 @@ class ArenaMap:
         return (t[r0] * (1 - dx) * (1 - dy) + t[r0 + 1] * dx * (1 - dy) +
                 t[r1] * (1 - dx) * dy + t[r1 + 1] * dx * dy) * 0.01
 
-    def blocking_prism(self, x, y, z):
+    def blocking_prism(self, x, y, z, pad=2.2):
         for idx in self.grid.get((self._cell(x), self._cell(y)), ()):
             p = self.prisms[idx]
-            if z + 8.5 < p["base"] or z + 1.3 > p["top"]:
+            minx, miny, maxx, maxy = p["bbox"]
+            if x < minx - pad or x > maxx + pad or y < miny - pad or y > maxy + pad:
+                continue
+            if z + 8.5 < p["base"] or z + 1.25 > p["top"]:
                 continue
             if self.inside_prism(p, x, y):
                 return p
+            if pad > 0.1:
+                if (self.inside_prism(p, x + pad, y) or self.inside_prism(p, x - pad, y) or
+                        self.inside_prism(p, x, y + pad) or self.inside_prism(p, x, y - pad)):
+                    return p
         return None
 
     def has_clear_shot(self, x1, y1, z1, x2, y2, z2):
         dist = math.hypot(x2 - x1, y2 - y1)
         if dist < 6.0:
             return True
-        n = max(3, min(64, int(dist / 4.0)))
+        n = max(3, min(48, int(dist / 5.0)))
         for s in range(1, n):
             tt = s / n
-            if tt * dist < 2.5 or (1.0 - tt) * dist < 2.5:
+            if tt * dist < 2.8 or (1.0 - tt) * dist < 2.8:
                 continue
             px = x1 + (x2 - x1) * tt
             py = y1 + (y2 - y1) * tt
@@ -178,8 +197,8 @@ UPGRADE_WEIGHTS = {
     "armor": 100, "nanites": 96, "plating": 92, "laser_charge": 88, "laser_damage": 84,
     "jets": 78, "capacitor": 75, "gun_rate": 72, "gun_damage": 68, "gyros": 62,
     "servos": 60, "reactor": 58, "gun_velocity": 55, "lightning_efficiency": 52,
-    "lightning_range": 50, "mortar_reload": 10, "mortar_velocity": 8, "gun_mag": 42,
-    "sensors": 35,
+    "lightning_range": 50, "mortar_reload": 10, "mortar_velocity": 8, "gun_mag": 44,
+    "sensors": 36,
 }
 WEAPON_RANK = {"laser": 4, "lightning": 3}
 
@@ -193,7 +212,6 @@ class Bot:
         self.cw = {k: (W.get(k) or {}) for k in ("gun", "laser", "lightning", "mortar")}
         cubes = cfg.get("cubes", {}) or {}
         self.cube_cap = int(cubes.get("stat_cap", 10))
-        self.cube_upgrade_goal = 15
         self.dpc = float(cubes.get("damage_per_cube", 0.04))
         self.reach = float((cfg.get("loot", {}) or {}).get("pickup_radius", 4.0))
         self.step_speed = float((cfg.get("sound", {}) or {}).get("step_speed", 5.0))
@@ -251,7 +269,8 @@ class Bot:
             ch = float(st.get("charge", c.get("charge", 0.75)))
             return dmg * 0.9 / (ch + cd) * 0.8 * mult
         if kind == "lightning":
-            if d > 46.0:
+            lrange = float(st.get("range", c.get("range", 45.0)))
+            if d > lrange + 2.0:
                 return 0.0
             dmg = float(st.get("damage", c.get("damage", 60.0)))
             cd = max(0.05, float(st.get("cooldown", c.get("cooldown", 0.25))))
@@ -272,11 +291,12 @@ class Bot:
         last_d = 0.0
         for dd in (3.0, 6.0, 10.0, 14.0):
             px, py = x + cs * dd, y + sn * dd
-            if self.arena.blocking_prism(px, py, z) is not None:
+            if self.arena.blocking_prism(px, py, z, pad=2.1) is not None:
                 return dd
             if on_ground:
                 g = self.arena.ground_z(px, py)
-                if (g - prev) / (dd - last_d) > 1.25:
+                # 50 deg slope is tan(50)=1.19; reject > 1.13 so we never stall on cliffs
+                if (g - prev) / (dd - last_d) > 1.13:
                     return dd
                 prev = g
             last_d = dd
@@ -309,13 +329,13 @@ class Bot:
         for s, yaw in cands[:8]:
             if self.clear_dist(x, y, z, yaw, grounded) < 8.0:
                 continue
-            px, py = x + math.cos(yaw) * 16.0, y + math.sin(yaw) * 16.0
+            px, py = x + math.cos(yaw) * 18.0, y + math.sin(yaw) * 18.0
             hid = 0
             for th in threats[:2]:
                 ex, ey, ez = th["pos"]
                 if not self.arena.has_clear_shot(ex, ey, ez + 8.0, px, py, z + 4.5):
                     hid += 1
-            sc = s + 1.1 * hid
+            sc = s + 1.0 * hid
             if sc > best_s:
                 best_s, best = sc, yaw
         if best is None:
@@ -332,13 +352,13 @@ class Bot:
             if dn > max_r:
                 continue
             dm = hyp(rx, ry, x, y)
-            if dm > 185.0:
+            if dm > 190.0:
                 continue
-            s = -dm * 0.60 + (22.0 - abs(h - 13.0)) * 1.6
+            s = -dm * 0.58 + (24.0 - abs(h - 15.0)) * 1.6
             if nrad * 0.42 <= dn <= max_r:
                 s += 65.0
             if alive <= 6:
-                s += 35.0
+                s += 40.0
             if s > best_s:
                 best_s, best = s, (rx, ry, rtop)
         if alive > 5 and self.arena.cover_spots:
@@ -352,7 +372,7 @@ class Bot:
             near.sort()
             for dm, dn, sx, sy in near[:12]:
                 gz = self.arena.ground_z(sx, sy)
-                if self.arena.blocking_prism(sx, sy, gz) is not None:
+                if self.arena.blocking_prism(sx, sy, gz, pad=2.1) is not None:
                     continue
                 if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
                     s = -dm * 0.60 + 82.0 + (45.0 if dn >= nrad * 0.45 else 0.0)
@@ -366,21 +386,17 @@ class Bot:
     def pick_waypoint(self, x, y, zone, t):
         ncx, ncy = zone["next_center"]
         nrad = zone["next_radius"]
-        zcx, zcy = zone["center"]
-        zrad = zone["radius"]
-        if t > zone["shrink_start"] - 40.0:
-            cx, cy, rr = ncx, ncy, nrad * 0.9
-        else:
-            cx, cy, rr = zcx, zcy, zrad - 40.0
+        # Stay inside next_radius during exploration so we never roam into future storm
+        cx, cy, rr = ncx, ncy, max(20.0, nrad * 0.88)
         best = None
         for _ in range(14):
             ang = self.rng.uniform(-math.pi, math.pi)
-            dd = self.rng.uniform(50.0, 140.0)
+            dd = self.rng.uniform(45.0, 125.0)
             px, py = x + math.cos(ang) * dd, y + math.sin(ang) * dd
             if hyp(px, py, cx, cy) > rr:
                 continue
             gz = self.arena.ground_z(px, py)
-            if self.arena.blocking_prism(px, py, gz) is not None:
+            if self.arena.blocking_prism(px, py, gz, pad=2.2) is not None:
                 continue
             nv = min([hyp(px, py, vx, vy) for vx, vy in self.visited] or [999.0])
             if nv < 45.0:
@@ -412,13 +428,16 @@ class Bot:
                     del mem[i]
 
     def lead_point(self, mx, my, mz, pos, vel, cz, speed):
+        # Full 3D lead (including vz for jumping/jetting mechs)
         px, py, pz = pos[0], pos[1], pos[2] + cz
-        vx, vy = vel[0], vel[1]
+        vx, vy, vz = vel[0], vel[1], vel[2]
         tt = math.dist((px, py, pz), (mx, my, mz)) / speed
         for _ in range(3):
-            qx, qy = px + vx * (tt + 0.05), py + vy * (tt + 0.05)
-            tt = math.dist((qx, qy, pz), (mx, my, mz)) / speed
-        return px + vx * (tt + 0.05), py + vy * (tt + 0.05), pz
+            dt = tt + 0.05
+            qx, qy, qz = px + vx * dt, py + vy * dt, pz + vz * dt * 0.7
+            tt = math.dist((qx, qy, qz), (mx, my, mz)) / speed
+        dt = tt + 0.05
+        return px + vx * dt, py + vy * dt, pz + vz * dt * 0.7
 
     def aim_to(self, mx, my, mz, tx, ty, tz):
         dx, dy = tx - mx, ty - my
@@ -452,7 +471,7 @@ class Bot:
 
         if tick >= self.next_flip:
             self.strafe *= -1.0
-            self.next_flip = tick + self.rng.randint(8, 22)
+            self.next_flip = tick + self.rng.randint(8, 20)
 
         if self.prev_pos is not None and hyp(x, y, self.prev_pos[0], self.prev_pos[1]) < 0.15:
             self.stuck += 1
@@ -466,6 +485,13 @@ class Bot:
                 if ev.get("bearing") is not None:
                     self.last_hit_tick = tick
                     self.last_hit_bearing = float(ev["bearing"])
+        # Track sniper beams even beyond 200m vision so front armor snaps toward them
+        for b in obs.get("beams", []) or []:
+            path = b.get("path") or []
+            if path:
+                bx, by = path[0][0], path[0][1]
+                self.last_sound_tick = tick
+                self.last_sound_bearing = math.atan2(by - y, bx - x)
         for s in obs.get("sounds", []) or []:
             if (s.get("kind") in ("gun", "laser", "laser_charge", "lightning", "mortar", "explosion")
                     and s.get("dist") in ("near", "mid") and s.get("bearing") is not None):
@@ -531,7 +557,7 @@ class Bot:
             else:
                 m["_clear"] = False
 
-        # Fight / Flee evaluator (fixed close-range & 2v1 thresholds)
+        # Fight / Flee evaluator (keep v31's proven 3.96 thresholds)
         target = None
         fight = False
         R = 0.0
@@ -573,12 +599,9 @@ class Bot:
                 tri *= 0.8
             R = ttk_them / max(0.1, ttk_me) * tri
             engaged = tick - self.engaged_tick < 25
-            # Don't commit to losing 2-to-1 close-range trades; penalize 2v1s
-            thr = 1.25 if d_t > 100.0 else (0.95 if d_t > 45.0 else 0.80)
-            if len(contacts) >= 2:
-                thr += 0.35
+            thr = 1.3 if d_t > 100.0 else (0.9 if d_t > 45.0 else 0.5)
             if engaged:
-                thr *= 0.85
+                thr *= 0.8
             if tick < self.flee_until:
                 thr *= 1.25
             if "laser" in mine_kinds:
@@ -590,7 +613,7 @@ class Bot:
                 self.engaged_tick = tick
                 self.cur_target_id = target["id"]
             else:
-                self.flee_until = max(self.flee_until, tick + 18)
+                self.flee_until = max(self.flee_until, tick + 15)
 
         goal = None
         goal_kind = "anchor"
@@ -609,12 +632,13 @@ class Bot:
             mode = "flee"
 
         lacks_laser = ("laser" not in mine_kinds)
-        farm_r = 100.0 if lacks_laser else 62.0
+        need_explore = (w1 is None and t < 150.0) or (lacks_laser and t < 95.0)
+        farm_r = 95.0 if (w1 is None or lacks_laser) else 62.0
 
-        if not contacts and hpf > 0.5:
+        if not contacts and hpf > 0.55:
             cand = []
-            if cubes < self.cube_upgrade_goal:
-                cand += [n for n in npcs if n["_d"] < (farm_r if cubes < self.cube_cap else 50.0)]
+            if cubes < self.cube_cap:
+                cand += [n for n in npcs if n["_d"] < farm_r]
             for c in obs.get("crates", []) or []:
                 dd = hyp(c["pos"][0], c["pos"][1], x, y)
                 if dd < farm_r:
@@ -636,7 +660,6 @@ class Bot:
                     break
             if goal is None and not urgent_zone and hpf > (0.35 if lacks_laser else 0.62):
                 best = None
-                lacks = lacks_laser
                 for i, e in self.mem["pickups"].items():
                     k = e[4]
                     rk = WEAPON_RANK.get(k, 0)
@@ -645,8 +668,8 @@ class Bot:
                     if w1 is not None and rk <= WEAPON_RANK.get(w1["kind"], 0):
                         continue
                     dd = hyp(e[0], e[1], x, y)
-                    lim = 280.0 if (lacks or w1 is None) else 90.0
-                    if dd > lim or abs(e[2] - z) > 13.0:
+                    lim = 260.0 if (lacks_laser or w1 is None) else 90.0
+                    if dd > lim or abs(e[2] - z) > 16.0:
                         continue
                     if e[2] - z > 3.0 and energy < 55.0:
                         continue
@@ -657,19 +680,17 @@ class Bot:
                     e = best[1]
                     goal = (e[0], e[1], e[2])
                     goal_kind = "weapon"
-                # Grab cubes up to 15 (tighter 50m radius past 10 to unlock 5th upgrade without overextending)
-                if goal is None and cubes < self.cube_upgrade_goal:
-                    cube_r = 85.0 if cubes < self.cube_cap else 50.0
+                if goal is None and cubes < self.cube_cap:
                     bc = None
                     for i, e in self.mem["cubes"].items():
                         dd = hyp(e[0], e[1], x, y)
-                        if dd < cube_r and abs(e[2] - z) < 13.0 and (e[2] - z < 3.0 or energy > 55.0):
+                        if dd < 85.0 and abs(e[2] - z) < 14.0 and (e[2] - z < 3.0 or energy > 55.0):
                             if bc is None or dd < bc[0]:
                                 bc = (dd, e)
                     if bc is not None:
                         goal = (bc[1][0], bc[1][1], bc[1][2])
                         goal_kind = "cube"
-                if goal is None and (cubes < self.cube_cap or lacks_laser):
+                if goal is None and (cubes < self.cube_cap or w1 is None):
                     bt = None
                     for n in npcs:
                         if cubes < self.cube_cap and n["_d"] < 75.0 and abs(n["pos"][2] - z) < 10.0:
@@ -677,14 +698,15 @@ class Bot:
                             break
                     for i, e in self.mem["crates"].items():
                         dd = hyp(e[0], e[1], x, y)
-                        if dd < (130.0 if lacks_laser else 75.0) and abs(e[2] - z) < 10.0 and (bt is None or dd < bt[0]):
+                        if dd < (120.0 if lacks_laser else 75.0) and abs(e[2] - z) < 10.0 and (bt is None or dd < bt[0]):
                             bt = (dd, (e[0], e[1], e[2]), 38.0)
                     if bt is not None:
                         goal = (bt[1][0], bt[1][1], bt[1][2])
                         goal_kind = "farm"
                         stand_off = bt[2]
-            if goal is None and lacks_laser and not urgent_zone and t < 240.0 and hpf > 0.5:
-                if self.wp is None or hyp(self.wp[0], self.wp[1], x, y) < 14.0 or tick - self.wp_tick > 300:
+            # Only roam open waypoints early until armed; after t=95s anchor on high ground!
+            if goal is None and need_explore and not urgent_zone and hpf > 0.55:
+                if self.wp is None or hyp(self.wp[0], self.wp[1], x, y) < 14.0 or tick - self.wp_tick > 220:
                     self.wp = self.pick_waypoint(x, y, zone, t)
                     self.wp_tick = tick
                 if self.wp is not None:
@@ -707,7 +729,10 @@ class Bot:
             if "lightning" in mine_kinds and "lightning" not in ek:
                 pref = 30.0
             elif "lightning" in ek and "lightning" not in mine_kinds:
-                pref = 80.0
+                pref = 85.0
+                # Boost out of enemy Lightning stun cone!
+                if d_t < 56.0 and energy > 28.0:
+                    boost = True
             elif "laser" in mine_kinds:
                 pref = 130.0
             else:
@@ -737,14 +762,17 @@ class Bot:
             nrm = math.hypot(ax, ay)
             if nrm > 1e-9:
                 ax, ay = ax / nrm, ay / nrm
-            zx, zy = (ncx - x), (ncy - y)
-            zn = max(1.0, math.hypot(zx, zy))
-            vx_ = ax * 0.75 + zx / zn * 0.30
-            vy_ = ay * 0.75 + zy / zn * 0.30
+            # Bias slightly toward zone only if near edge; avoid running straight into crowded center
+            if d_next > nrad * 0.80:
+                zx, zy = (ncx - x), (ncy - y)
+                zn = max(1.0, math.hypot(zx, zy))
+                vx_ = ax * 0.72 + zx / zn * 0.35
+                vy_ = ay * 0.72 + zy / zn * 0.35
+            else:
+                vx_, vy_ = ax, ay
             desired = math.atan2(vy_, vx_)
             near_t = contacts[0]["_d"]
-            # Boost into cover whenever close OR actively taking fire
-            boost = bool((near_t < 85.0 or (tick - self.last_dmg_tick <= 15)) and energy > 30.0)
+            boost = bool(near_t < 75.0 and energy > 35.0)
             tcl = target
         else:
             if urgent_zone:
@@ -784,7 +812,7 @@ class Bot:
                 continue
             rx, ry, rz = x - pr["pos"][0], y - pr["pos"][1], (z + 4.5) - pr["pos"][2]
             tt = (rx * vx2 + ry * vy2 + rz * vz2) / v2
-            if tt < 0.1 or tt > 1.2:
+            if tt < 0.08 or tt > 1.2:
                 continue
             cx2, cy2, cz2 = rx - vx2 * tt, ry - vy2 * tt, rz - vz2 * tt
             miss = math.sqrt(cx2 * cx2 + cy2 * cy2 + cz2 * cz2)
@@ -821,14 +849,16 @@ class Bot:
 
         move_yaw = desired
         climb_ok = (gz > z + 2.5 and dist_goal < 45.0 and mode == "calm" and goal_kind != "farm")
+        flee_climb_ok = (mode == "flee" and contacts and contacts[0]["_d"] < 95.0)
         slow_for_time = (time.perf_counter() - t0) > 0.030
         if speed > 0.05 and not weave:
             if self.escape_until > tick:
                 move_yaw = wrap(desired + self.escape_sign * 1.4)
             else:
-                wall = self.arena.blocking_prism(x + math.cos(desired) * 5.0, y + math.sin(desired) * 5.0, z)
-                if (wall is not None and climb_ok and (wall["top"] - z) <= 18.5 and
-                        ((not grounded and energy > 10.0) or (grounded and energy >= 38.0))):
+                wall = self.arena.blocking_prism(x + math.cos(desired) * 5.0, y + math.sin(desired) * 5.0, z, pad=2.2)
+                if (wall is not None and (climb_ok or flee_climb_ok) and (wall["top"] - z) <= 23.0 and
+                        ((not grounded and energy > 10.0) or (grounded and energy >= (48.0 if (wall["top"] - z) > 16.0 else 38.0)))):
+                    # Jet cleanly onto rooftops both when anchoring AND when escaping chasers!
                     if grounded:
                         jump = True
                     boost = True
@@ -849,7 +879,7 @@ class Bot:
                     jump = True
                 boost = True
 
-        out["move"] = [math.cos(move_yaw) * speed, math.sin(move_yaw) * speed]
+        out["move"] = [round(math.cos(move_yaw) * speed, 4), round(math.sin(move_yaw) * speed, 4)]
         out["boost"] = bool(boost)
         out["jump"] = bool(jump)
 
@@ -869,60 +899,72 @@ class Bot:
         aim_is_mech = False
         if tcl is not None and tcl.get("_clear") and tcl["_d"] <= 268.0:
             sc = 1.0 + 0.05 * tcl.get("cubes", 0)
-            aim_t = (tcl["pos"], tcl.get("vel", [0.0, 0.0, 0.0]), 4.5 * sc, tcl["_d"])
+            aim_t = (tcl["pos"], tcl.get("vel", [0.0, 0.0, 0.0]), 4.5 * sc, tcl["_d"], sc, float(tcl.get("hp", 1000.0)))
             aim_is_mech = True
         elif mode == "calm" and farm is not None:
             cz = 1.5 if farm.get("_crate") else 1.8
-            aim_t = (farm["pos"], farm.get("vel", [0.0, 0.0, 0.0]), cz, farm["_d"])
+            aim_t = (farm["pos"], farm.get("vel", [0.0, 0.0, 0.0]), cz, farm["_d"], 0.8, 350.0)
 
         mx, my, mz = x, y, z + muzzle_h
         if aim_t is not None:
-            tpos, tvel, tcz, td = aim_t
+            tpos, tvel, tcz, td, tsc, thp = aim_t
             gspeed = 252.0
             if gun_i is not None:
                 gspeed = float(weapons[gun_i].get("stats", {}).get("speed", 252.0))
             lx, ly, lz = self.lead_point(mx, my, mz, tpos, tvel, tcz, max(50.0, gspeed))
             lead_yaw, lead_pitch = self.aim_to(mx, my, mz, lx, ly, lz)
-            dir_yaw, dir_pitch = self.aim_to(mx, my, mz, tpos[0], tpos[1], tpos[2] + tcz)
+            # 1-tick (0.05s) hitscan lead for crisp Laser release
+            hx, hy, hz = tpos[0] + tvel[0] * 0.05, tpos[1] + tvel[1] * 0.05, tpos[2] + tcz + tvel[2] * 0.04
+            dir_yaw, dir_pitch = self.aim_to(mx, my, mz, hx, hy, hz)
             cmd_yaw, cmd_pitch = lead_yaw, lead_pitch
+
+            # Hold Gun fire while fleeing at low HP (>55m away) so 5s nanite regen actually triggers!
+            hold_for_regen = (mode == "flee" and hpf < 0.60 and td > 55.0 and thp > 350.0)
 
             if laser_i is not None and aim_is_mech:
                 lw = weapons[laser_i]
                 charge = float(lw.get("charge", 0.0) or 0.0)
                 lst = lw.get("stats", {}) or {}
                 full = float(lst.get("charge", self.cw["laser"].get("charge", 0.75)))
+                lrange = float(lst.get("range", 280.0))
                 ready = float(lw.get("cooldown", 0.0)) <= 0.06
                 if charge > 0.0:
                     fire[laser_i] = True
-                    if charge >= full - 0.04:
+                    # Pre-snap aim onto hitscan body 0.25s BEFORE full charge so release is instant!
+                    if charge >= full - 0.28:
                         cmd_yaw, cmd_pitch = dir_yaw, dir_pitch
-                        # Progressive tolerance so we don't walk at 50% speed for 2s chasing a 0.015 rad lock
+                    if charge >= full - 0.06:
                         over = max(0.0, charge - full)
-                        tol_l = clamp(math.atan2(2.4, max(10.0, td)) * (0.95 + over * 2.5), 0.016, 0.14)
+                        tol_l = clamp(math.atan2(2.3 * tsc, max(10.0, td)) * (1.0 + over * 2.5), 0.022, 0.14)
                         err_l = math.hypot(wrap(dir_yaw - ayaw) * math.cos(apitch), (dir_pitch - apitch) * 0.5)
-                        if err_l < tol_l or over > 0.45:
+                        if err_l < tol_l or over > 0.35:
                             fire[laser_i] = False
-                elif ready and mode == "fight" and td <= 262.0:
+                elif ready and mode == "fight" and td <= lrange - 8.0:
                     fire[laser_i] = True
 
             err = math.hypot(wrap(cmd_yaw - ayaw) * math.cos(apitch), (cmd_pitch - apitch) * 0.5)
-            if gun_i is not None:
+            if gun_i is not None and not hold_for_regen:
                 gw = weapons[gun_i]
                 gst = gw.get("stats", {}) or {}
                 grange = float(gst.get("range", 230.0))
                 ammo = float(gw.get("ammo", 1))
                 rel = float(gw.get("reload", 0.0) or 0.0)
-                tol_g = clamp(math.atan2(2.6, max(8.0, td)) * 1.5, 0.025, 0.14)
-                if ammo > 0 and rel <= 0.0 and td <= grange * 0.93:
+                tol_g = clamp(math.atan2(2.6 * tsc, max(8.0, td)) * 1.5, 0.028, 0.15)
+                if ammo > 0 and rel <= 0.0 and td <= grange * 0.94:
                     if err < tol_g:
                         fire[gun_i] = True
                 elif ammo <= 0 and rel <= 0.0:
                     out["reload"] = True
-            if lt_i is not None and td <= 43.0:
-                e_l = abs(wrap(dir_yaw - ayaw))
-                ok_energy = energy > 14.0 and (aim_is_mech or energy > 60.0)
-                if e_l < 0.40 and ok_energy:
-                    fire[lt_i] = True
+            if lt_i is not None:
+                ltw = weapons[lt_i]
+                ltst = ltw.get("stats", {}) or {}
+                ltrange = float(ltst.get("range", 45.0))
+                ltcone = math.radians(float(ltst.get("cone_deg", 30.0))) * 0.65
+                if td <= ltrange - 1.5:
+                    e_l = abs(wrap(dir_yaw - ayaw))
+                    ok_energy = energy > 14.0 and (aim_is_mech or energy > 60.0)
+                    if e_l < max(0.35, ltcone) and ok_energy:
+                        fire[lt_i] = True
             out["aim"] = [cmd_yaw, cmd_pitch]
         else:
             if laser_i is not None and float(weapons[laser_i].get("charge", 0.0) or 0.0) > 0.0:
@@ -933,16 +975,19 @@ class Bot:
                 look = math.atan2(c0["pos"][1] - y, c0["pos"][0] - x)
             elif tick - self.last_hit_tick < 30 and self.last_hit_bearing is not None:
                 look = self.last_hit_bearing
-            elif tick - self.last_sound_tick < 12 and self.last_sound_bearing is not None:
+            elif tick - self.last_sound_tick < 15 and self.last_sound_bearing is not None:
                 look = self.last_sound_bearing
             elif weave:
-                look = (tick * 0.09) % TAU
+                # Keep 180-deg front armor toward zone center while scanning
+                center_yaw = math.atan2(ncy - y, ncx - x)
+                look = center_yaw + 1.05 * math.sin(tick * 0.16)
             else:
-                look = move_yaw + 1.8 * math.sin(tick * 0.12)
+                look = move_yaw + 1.10 * math.sin(tick * 0.16)
             out["aim"] = [wrap(look), 0.0]
             if gun_i is not None:
                 gw = weapons[gun_i]
-                if not contacts and float(gw.get("ammo", 12)) < 6 and float(gw.get("reload", 0.0) or 0.0) <= 0.0:
+                gmag = float((gw.get("stats", {}) or {}).get("mag", 12))
+                if float(gw.get("ammo", gmag)) < (gmag if not contacts else 4) and float(gw.get("reload", 0.0) or 0.0) <= 0.0:
                     out["reload"] = True
 
         out["fire"] = [bool(fire[0]), bool(fire[1])]
