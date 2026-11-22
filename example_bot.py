@@ -230,6 +230,13 @@ class Bot:
         self.ring = deque(maxlen=60)
         self.last_status = -999
         self.dmg_lines = 0
+        self.cover = None
+        self.cover_tick = -999
+        self.cover_until = -1
+        self.cover_off_until = -1
+        self.cover_wp = None
+        self.cover_vis = []
+        self.build_peek()
 
     # ------------------------------------------------------------------ helpers
     def choose_upgrade(self, offer):
@@ -326,6 +333,124 @@ class Bot:
                 best_s, best = sc, yaw
         if best is None:
             return self.plan_heading(x, y, z, grounded, desired)
+        return best
+
+    def build_peek(self):
+        A = self.arena
+        self.peek = {}
+        for p in A.prisms:
+            if p["top"] - p["base"] < 7.0:
+                continue
+            ring = p["ring"]
+            n = len(ring) // 2
+            if n < 3 or n > 80:
+                continue
+            minx, miny, maxx, maxy = p["bbox"]
+            cx_, cy_ = (minx + maxx) * 0.5, (miny + maxy) * 0.5
+            for k in range(n):
+                vx, vy = ring[2 * k], ring[2 * k + 1]
+                dx, dy = vx - cx_, vy - cy_
+                dd = math.hypot(dx, dy)
+                if dd > 1.0:
+                    sx, sy = vx + dx / dd * 4.0, vy + dy / dd * 4.0
+                    self.peek.setdefault((A._cell(sx), A._cell(sy)), []).append((sx, sy))
+                j = (k + 1) % n
+                wx, wy = ring[2 * j], ring[2 * j + 1]
+                ex_, ey_ = wx - vx, wy - vy
+                el = math.hypot(ex_, ey_)
+                if el > 12.0:
+                    mx, my = (vx + wx) * 0.5, (vy + wy) * 0.5
+                    nx_, ny_ = ey_ / el, -ex_ / el
+                    if (mx - cx_) * nx_ + (my - cy_) * ny_ < 0.0:
+                        nx_, ny_ = -nx_, -ny_
+                    sx, sy = mx + nx_ * 4.0, my + ny_ * 4.0
+                    self.peek.setdefault((A._cell(sx), A._cell(sy)), []).append((sx, sy))
+
+    def walk_clear(self, x1, y1, x2, y2, z):
+        d = hyp(x1, y1, x2, y2)
+        n = max(1, int(d / 2.0))
+        for k in range(1, n + 1):
+            tt = k / n
+            if self.arena.blocking_prism(x1 + (x2 - x1) * tt, y1 + (y2 - y1) * tt, z) is not None:
+                return False
+        return True
+
+    def cover_via(self, x, y, z, cx_, cy_):
+        if self.walk_clear(x, y, cx_, cy_, z):
+            return None
+        A = self.arena
+        ci, cj = A._cell(x), A._cell(y)
+        best, best_l = None, 1e9
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for sx, sy in self.peek.get((ci + di, cj + dj), ()):
+                    d1 = hyp(sx, sy, x, y)
+                    if d1 < 3.0 or d1 > 50.0:
+                        continue
+                    ln = d1 + hyp(sx, sy, cx_, cy_)
+                    if ln >= best_l:
+                        continue
+                    if self.walk_clear(x, y, sx, sy, z) and self.walk_clear(sx, sy, cx_, cy_, z):
+                        best, best_l = (sx, sy), ln
+        if best is not None:
+            return best
+        best_d = hyp(x, y, cx_, cy_) + 15.0
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for sx, sy in self.peek.get((ci + di, cj + dj), ()):
+                    d1 = hyp(sx, sy, x, y)
+                    if d1 < 3.0 or d1 > 40.0:
+                        continue
+                    if any(hyp(sx, sy, vx, vy) < 2.0 for vx, vy in self.cover_vis):
+                        continue
+                    d2 = hyp(sx, sy, cx_, cy_)
+                    if d2 < best_d and self.walk_clear(x, y, sx, sy, z):
+                        best, best_d = (sx, sy), d2
+        if best is not None:
+            self.cover_vis.append(best)
+        return best
+
+    def find_cover(self, x, y, z, grounded, threats, ncx, ncy, nrad):
+        A = self.arena
+        gz0 = A.ground_z(x, y)
+        cands = []
+        for k in range(12):
+            yaw = k * TAU / 12.0 - math.pi
+            free = self.clear_dist(x, y, z, yaw, grounded)
+            for r in (6.0, 12.0, 20.0):
+                if free < 99.0 and r > free - 1.5:
+                    break
+                cands.append((r, x + math.cos(yaw) * r, y + math.sin(yaw) * r))
+        ci, cj = A._cell(x), A._cell(y)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for sx, sy in self.peek.get((ci + di, cj + dj), ()):
+                    d = hyp(sx, sy, x, y)
+                    if d < 45.0:
+                        cands.append((d, sx, sy))
+        cands.sort()
+        best, best_s = None, -1e9
+        tested = 0
+        for d, px, py in cands:
+            if tested >= 30:
+                break
+            if hyp(px, py, ncx, ncy) > nrad * 0.95:
+                continue
+            gz = A.ground_z(px, py)
+            if gz > gz0 + 3.0:
+                continue
+            if A.blocking_prism(px, py, gz) is not None:
+                continue
+            tested += 1
+            seen = 0
+            for th in threats:
+                ex, ey, ez = th["pos"]
+                if A.has_clear_shot(ex, ey, ez + 5.0, px, py, gz + 4.5):
+                    seen += 1
+            sc = -3.0 * seen - d * 0.05
+            if sc > best_s:
+                best_s = sc
+                best = (px, py, gz, seen)
         return best
 
     def pick_anchor(self, x, y, zone, alive):
@@ -563,7 +688,7 @@ class Bot:
                 eyaw = m.get("aim", [0.0, 0.0])[0]
                 face = 1.0 if abs(wrap(bear - eyaw)) < 0.7 else 0.55
                 m["_threat"] = face * sum(self.wdps(k, m["_d"], mm) for k in kinds)
-                threat_total += m["_threat"]
+                threat_total += m["_threat"] * (1.0 if m.get("_clear") else 0.35)
 
             def tscore(m):
                 s = m["_d"] + float(m.get("hp", 1000.0)) * 0.08
@@ -778,6 +903,49 @@ class Bot:
             else:
                 desired = goal_yaw
 
+        # ------------------------------------------------- peek fighting from cover
+        cover_on = False
+        seers = [m for m in contacts[:6] if m.get("_clear") and m["_d"] < 175.0]
+        if self.cover is not None and tick >= self.cover_until:
+            self.cover = None
+            self.cover_off_until = tick + 60
+        if len(contacts) >= 2 and not urgent_zone and tick >= self.cover_off_until:
+            need = len(seers) >= 2
+            cdist = hyp(self.cover[0], self.cover[1], x, y) if self.cover is not None else 999.0
+            if need and (self.cover is None or tick - self.cover_tick >= 10):
+                if (time.perf_counter() - t0) < 0.018:
+                    c = self.find_cover(x, y, z, grounded, contacts[:3], ncx, ncy, nrad)
+                    if c is not None and self.cover is not None and hyp(c[0], c[1], self.cover[0], self.cover[1]) < 3.0:
+                        self.cover_tick = tick
+                        c = None
+                    if c is not None and c[3] < len(seers):
+                        if self.cover is None:
+                            self.cover_until = tick + 160
+                        self.cover = c
+                        self.cover_tick = tick
+                        cdist = hyp(c[0], c[1], x, y)
+                        self.cover_vis = []
+                        self.cover_wp = self.cover_via(x, y, z, c[0], c[1])
+            if self.cover is not None:
+                cover_on = True
+                cx_, cy_ = self.cover[0], self.cover[1]
+                boost = False
+                if self.cover_wp is not None and hyp(self.cover_wp[0], self.cover_wp[1], x, y) < 2.5:
+                    self.cover_wp = self.cover_via(x, y, z, cx_, cy_)
+                if cdist > 2.5 and self.cover_wp is not None:
+                    desired = math.atan2(self.cover_wp[1] - y, self.cover_wp[0] - x)
+                    speed = 1.0
+                elif cdist > 2.5:
+                    desired = math.atan2(cy_ - y, cx_ - x)
+                    speed = 1.0
+                else:
+                    desired = wrap(math.atan2(cy_ - y, cx_ - x) + self.strafe * 1.2)
+                    speed = 0.3
+                if tcl is None:
+                    tcl = target
+        elif self.cover is not None and len(contacts) <= 1:
+            self.cover = None
+
         # zone override during fight/flee
         if mode in ("fight", "flee") and urgent_zone:
             zyaw = math.atan2(ncy - y, ncx - x) if in_zone else math.atan2(zcy - y, zcx - x)
@@ -850,7 +1018,7 @@ class Bot:
                     boost = True
                 elif slow_for_time:
                     move_yaw = desired
-                elif mode == "flee" and contacts:
+                elif mode == "flee" and contacts and not cover_on:
                     move_yaw = self.flee_heading(x, y, z, grounded, desired, contacts)
                 else:
                     move_yaw = self.plan_heading(x, y, z, grounded, desired)
@@ -1072,4 +1240,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# v36 rerun - fresh seeds
+# v40 peek fighter: hide when 2+ enemies see us, fight one at a time from cover
