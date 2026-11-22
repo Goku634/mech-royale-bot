@@ -1,4 +1,5 @@
-"""v31 - v30 + active laser hunt (waypoint exploration, crate priority, cautious until armed)."""
+"""v30 - TTK fight/flee engine, hitscan discipline, crate+NPC farming, regen-aware disengage.
+Self-contained: own stdin/stdout loop, standard library only."""
 import json
 import math
 import os
@@ -176,7 +177,7 @@ class ArenaMap:
 
 
 UPGRADE_WEIGHTS = {
-    "laser_damage": 100, "laser_charge": 98, "gun_damage": 96, "gun_rate": 94, "armor": 92, "nanites": 90, "plating": 86,
+    "armor": 100, "nanites": 96, "plating": 92, "laser_charge": 88, "laser_damage": 84,
     "jets": 78, "capacitor": 75, "gun_rate": 70, "gun_damage": 66, "gyros": 62,
     "servos": 60, "reactor": 58, "gun_velocity": 55, "lightning_efficiency": 52,
     "lightning_range": 50, "mortar_reload": 10, "mortar_velocity": 8, "gun_mag": 42,
@@ -226,9 +227,6 @@ class Bot:
         self.wp = None
         self.wp_tick = -999
         self.visited = []
-        self.perch = None
-        self.perch_tick = -999
-        self.perch_off_until = -1
         self.ring = deque(maxlen=60)
         self.last_status = -999
         self.dmg_lines = 0
@@ -400,25 +398,6 @@ class Bot:
         self.visited.append((best[1], best[2]))
         if len(self.visited) > 10:
             self.visited.pop(0)
-        return (best[1], best[2], best[3])
-
-    def pick_perch(self, x, y, zone):
-        ncx, ncy = zone["next_center"]
-        nrad = zone["next_radius"]
-        max_r = max(14.0, nrad * 0.86)
-        best = None
-        for rx, ry, rtop, h in self.arena.rooftops:
-            if h < 9.0 or h > 18.0:
-                continue
-            if hyp(rx, ry, ncx, ncy) > max_r:
-                continue
-            dm = hyp(rx, ry, x, y)
-            if dm > 70.0:
-                continue
-            if best is None or dm < best[0]:
-                best = (dm, rx, ry, rtop)
-        if best is None:
-            return None
         return (best[1], best[2], best[3])
 
     def update_mem(self, obs, x, y, tick):
@@ -620,10 +599,6 @@ class Bot:
             elif "lightning" not in mine_kinds:
                 thr *= 1.3
             fight = R >= thr
-            if len(contacts) == 1 and hpf > 0.45:
-                fight = True
-            if len(contacts) >= 2 or hpf < 0.4:
-                self.perch_off_until = tick + 100
             if fight:
                 self.engaged_tick = tick
                 self.cur_target_id = target["id"]
@@ -729,16 +704,6 @@ class Bot:
                 if self.wp is not None:
                     goal = self.wp
                     goal_kind = "explore"
-            max_r = max(14.0, nrad * 0.86)
-            if (goal is None and not lacks_laser and not urgent_zone and hpf > 0.4
-                    and False):
-                if (self.perch is None or tick - self.perch_tick > 150 or
-                        hyp(self.perch[0], self.perch[1], ncx, ncy) > max(14.0, nrad * 0.86)):
-                    self.perch = self.pick_perch(x, y, zone)
-                    self.perch_tick = tick
-                if self.perch is not None and (energy > 55.0 or z > self.arena.ground_z(x, y) + 4.0):
-                    goal = self.perch
-                    goal_kind = "perch"
             if goal is None:
                 goal = self.anchor
                 goal_kind = "anchor"
@@ -769,9 +734,6 @@ class Bot:
                 radial = 0.9
             else:
                 radial = 0.0
-            on_roof = z > self.arena.ground_z(x, y) + 4.0
-            if on_roof and len(contacts) <= 1 and hpf >= 0.4 and target["_clear"]:
-                radial = 0.0
             sa = away + self.strafe * (math.pi * 0.5)
             vx_ = radial * math.cos(away) + 0.95 * math.cos(sa)
             vy_ = radial * math.sin(away) + 0.95 * math.sin(sa)
@@ -779,8 +741,6 @@ class Bot:
             speed = 1.0
             if not target["_clear"]:
                 speed = 0.9
-            if on_roof and radial == 0.0:
-                speed = 0.55
             tcl = target
         elif mode == "flee":
             ax = ay = 0.0
@@ -803,7 +763,7 @@ class Bot:
             if urgent_zone:
                 desired = math.atan2(ncy - y, ncx - x) if in_zone else math.atan2(zcy - y, zcx - x)
                 boost = bool((not in_zone) and energy > 20.0)
-            elif goal_kind in ("anchor", "perch") and dist_goal < 4.5 and abs(z - gz) < 2.5:
+            elif goal_kind == "anchor" and dist_goal < 4.5 and abs(z - gz) < 2.5:
                 oa = (tick * 0.14) % TAU
                 desired = math.atan2(gy + math.sin(oa) * 2.8 - y, gx + math.cos(oa) * 2.8 - x)
                 speed = min(0.42, self.step_speed * 0.86 / max(1.0, walk))
@@ -1112,4 +1072,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# rerun v36 fresh seeds
+# v36 rerun - fresh seeds
