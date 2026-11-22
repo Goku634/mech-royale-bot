@@ -1,4 +1,4 @@
-"""v13 Built on v9 (2.54) Core + Exact Config Upgrades, Dynamic Laser Charge & CQC Lightning."""
+"""v14 Telemetry-Driven AI: Fast Low-Roof Climbs (10-24m), Outer-Flank Opening & Supply Drop Capture."""
 import json
 import math
 import os
@@ -31,7 +31,6 @@ class ArenaMap:
     def __init__(self, map_dir: str):
         self.prisms = []
         self.rooftops = []
-        self.cover_spots = []
         self.terrain = None
         self.nx = 0
         self.ny = 0
@@ -63,16 +62,10 @@ class ArenaMap:
                     }
                     self.prisms.append(prism)
                     height = top - base
-                    if 9.0 <= height <= 52.0 and (maxx - minx) >= 15.0 and (maxy - miny) >= 15.0:
+                    # Fast-climb roofs (10m-25m): clear in <1.4s with 60+ energy left!
+                    if 10.0 <= height <= 25.0 and (maxx - minx) >= 15.0 and (maxy - miny) >= 15.0:
                         if point_in_poly(cx, cy, ring) and not any(point_in_poly(cx, cy, h) for h in p.get("holes", [])):
-                            self.rooftops.append((cx, cy, top))
-                    if height >= 10.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
-                        for idx in range(0, len(ring), 4):
-                            vx, vy = ring[idx], ring[idx + 1]
-                            dx, dy = vx - cx, vy - cy
-                            d = math.hypot(dx, dy)
-                            if d > 1.0:
-                                self.cover_spots.append((vx + (dx / d) * 4.2, vy + (dy / d) * 4.2))
+                            self.rooftops.append((cx, cy, top, height))
 
             t_meta = w.get("terrain", {})
             self.nx = int(t_meta.get("nx", 0))
@@ -89,22 +82,6 @@ class ArenaMap:
                     self.terrain = struct.unpack(f"<{count}h", raw[: count * 2])
         except Exception as e:
             mf.log(f"Map load warning: {e}")
-
-    def ground_z(self, x: float, y: float) -> float:
-        if not self.terrain:
-            return 0.0
-        fx = max(0.0, min(self.nx - 1.001, (x - self.min_x) / self.step))
-        fy = max(0.0, min(self.ny - 1.001, (y - self.min_y) / self.step))
-        i, j = int(fx), int(fy)
-        dx, dy = fx - i, fy - j
-        row0 = j * self.nx
-        row1 = (j + 1) * self.nx
-        z00 = self.terrain[row0 + i]
-        z10 = self.terrain[row0 + i + 1]
-        z01 = self.terrain[row1 + i]
-        z11 = self.terrain[row1 + i + 1]
-        return (z00 * (1 - dx) * (1 - dy) + z10 * dx * (1 - dy) +
-                z01 * (1 - dx) * dy + z11 * dx * dy) * 0.01
 
     def is_blocked(self, x: float, y: float, z: float, pad: float = 2.6) -> bool:
         for p in self.prisms:
@@ -152,7 +129,6 @@ class Bot:
     def __init__(self, hello: mf.Hello):
         cfg = hello.get("config", {})
         self.reach = float(cfg.get("loot", {}).get("pickup_radius", 4.0))
-        self.step_speed = float(cfg.get("sound", {}).get("step_speed", 5.0))
         self.cube_cap = int(cfg.get("cubes", {}).get("stat_cap", 10))
         self.mortar_g = float(cfg.get("weapons", {}).get("mortar", {}).get("gravity", 22.0))
         map_dir = hello.get("map", {}).get("dir", "/arena")
@@ -162,22 +138,20 @@ class Bot:
         self.stuck_ticks = 0
         self.last_threat_yaw = None
         self.last_threat_tick = -999
-        self.spotted_until_tick = -999
         self.strafe_dir = 1.0
         self.anchor = None
         self.anchor_tick = -999
 
-        # Exact upgrade ID weights derived from server config
         self.upgrade_weights = {
             "armor": 100,
-            "nanites": 95,
-            "plating": 90,
-            "laser_charge": 85,
-            "laser_damage": 80,
-            "jets": 75,
-            "capacitor": 72,
-            "gun_rate": 68,
-            "gun_damage": 65,
+            "nanites": 96,
+            "plating": 92,
+            "laser_charge": 88,
+            "laser_damage": 84,
+            "jets": 78,
+            "capacitor": 75,
+            "gun_rate": 70,
+            "gun_damage": 66,
             "gyros": 62,
             "servos": 60,
             "reactor": 58,
@@ -204,47 +178,26 @@ class Bot:
     def _weapon_rank(self, kind: str) -> int:
         return {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}.get(kind, 0)
 
-    def _pick_anchor(self, x: float, y: float, z: float, zone: dict, alive: int, cubes: int) -> tuple:
+    def _pick_rooftop(self, x: float, y: float, z: float, zone: dict, t: float) -> tuple:
         ncx, ncy = zone["next_center"]
         nrad = zone["next_radius"]
-        max_r = max(14.0, nrad * 0.85)
-
-        if alive > 7 and cubes < 7 and self.arena.cover_spots:
-            nearby = []
-            for sx, sy in self.arena.cover_spots:
-                d_next = math.hypot(sx - ncx, sy - ncy)
-                if d_next <= max_r:
-                    d_me = math.hypot(sx - x, sy - y)
-                    if d_me <= 170.0:
-                        nearby.append((d_me, d_next, sx, sy))
-            nearby.sort(key=lambda item: item[0])
-            best = None
-            best_score = -1e9
-            for d_me, d_next, sx, sy in nearby[:12]:
-                gz = self.arena.ground_z(sx, sy)
-                if self.arena.is_blocked(sx, sy, gz, pad=2.2):
-                    continue
-                score = -d_me * 0.65 + (45.0 if d_next >= nrad * 0.40 else 0.0)
-                if not self.arena.has_clear_shot(sx, sy, gz + 6.0, ncx, ncy, gz + 6.0):
-                    score += 80.0
-                if score > best_score:
-                    best_score = score
-                    best = (sx, sy, gz)
-            if best is not None:
-                return best
+        max_r = max(14.0, nrad * 0.86)
+        # During first 38s, stay in outer flank ring (0.50-0.86 nrad) to avoid center spawn bloodbath
+        min_ring = nrad * (0.50 if t < 38.0 else 0.30)
 
         best = None
         best_score = -1e9
-        for rx, ry, rtop in self.arena.rooftops:
+        for rx, ry, rtop, h in self.arena.rooftops:
             d_next = math.hypot(rx - ncx, ry - ncy)
             if d_next > max_r:
                 continue
             d_me = math.hypot(rx - x, ry - y)
-            if d_me > 185.0:
+            if d_me > 190.0:
                 continue
-            score = -d_me * 0.65 + min(38.0, rtop) * 1.55
-            if nrad * 0.40 <= d_next <= max_r:
-                score += 55.0
+            # Prefer fast-climb 12-20m roofs so we never stall mid-air
+            score = -d_me * 0.65 + (24.0 - abs(h - 16.0)) * 1.4
+            if min_ring <= d_next <= max_r:
+                score += 60.0
             if score > best_score:
                 best_score = score
                 best = (rx, ry, rtop)
@@ -275,7 +228,7 @@ class Bot:
         alive = int(obs["alive"])
         cubes = int(me["cubes"])
 
-        if tick % 20 == 0:
+        if tick % 18 == 0:
             self.strafe_dir *= -1.0
 
         if self.prev_pos is not None:
@@ -296,19 +249,14 @@ class Bot:
         npcs.sort(key=lambda m: math.dist(m["pos"], me["pos"]))
 
         for ev in obs.get("events", []):
-            if ev.get("type") == "damaged":
-                self.spotted_until_tick = tick + 60
-                if ev.get("bearing") is not None:
-                    self.last_threat_yaw = ev["bearing"]
-                    self.last_threat_tick = tick
+            if ev.get("type") == "damaged" and ev.get("bearing") is not None:
+                self.last_threat_yaw = ev["bearing"]
+                self.last_threat_tick = tick
 
         for s in obs.get("sounds", []):
             if s.get("dist") in ("near", "mid"):
                 self.last_threat_yaw = s["bearing"]
                 self.last_threat_tick = tick
-
-        if mechs:
-            self.spotted_until_tick = max(self.spotted_until_tick, tick + 55)
 
         w0, w1 = me["weapons"][0], me["weapons"][1]
         best_pickup = None
@@ -344,13 +292,24 @@ class Bot:
 
         if (self.anchor is None or tick - self.anchor_tick > 55 or
                 math.hypot(self.anchor[0] - ncx, self.anchor[1] - ncy) > nrad * 0.88):
-            self.anchor = self._pick_anchor(x, y, z, zone, alive, cubes)
+            self.anchor = self._pick_rooftop(x, y, z, zone, t)
             self.anchor_tick = tick
 
         goal_x, goal_y, goal_z = self.anchor
 
+        # Check for uncontested Supply Drop (+3 cubes + full HP/energy heal!)
+        capturing_drop = False
+        if not urgent_zone and len(mechs) <= 1 and (cubes < self.cube_cap or hp_frac < 0.70):
+            for dr in obs.get("drops", []):
+                if dr.get("lands_in", 99.0) <= 10.0 and dr.get("holder") in (None, me["id"]):
+                    d_drop = math.dist(dr["pos"][:2], (x, y))
+                    if d_drop < 95.0:
+                        goal_x, goal_y, goal_z = dr["pos"]
+                        capturing_drop = True
+                        break
+
         farming_loot = False
-        if not urgent_zone and not mechs and hp_frac > 0.55:
+        if not urgent_zone and not capturing_drop and not mechs and hp_frac > 0.55:
             if cubes < self.cube_cap:
                 near_cubes = [
                     c for c in obs.get("cubes", [])
@@ -370,7 +329,7 @@ class Bot:
                     farming_loot = True
 
         avoid_cube = None
-        if cubes >= self.cube_cap:
+        if cubes >= self.cube_cap and not capturing_drop:
             for c in obs.get("cubes", []):
                 if math.dist(c["pos"][:2], (x, y)) < 6.0 and abs(c["pos"][2] - z) < 4.0:
                     avoid_cube = c["pos"]
@@ -401,7 +360,7 @@ class Bot:
         elif avoid_cube is not None:
             move_yaw = math.atan2(y - avoid_cube[1], x - avoid_cube[0])
             speed_scale = 0.8
-        elif mechs:
+        elif mechs and not (capturing_drop and dist_goal < 8.0):
             closest = mechs[0]
             ex, ey, ez = closest["pos"]
             edist = math.hypot(ex - x, ey - y)
@@ -426,20 +385,19 @@ class Bot:
         else:
             if dist_goal < 3.5 and abs(z - goal_z) < 2.0:
                 speed_scale = 0.0
-            elif tick > self.spotted_until_tick and not farming_loot:
-                walk_spd = me.get("stats", {}).get("walk_speed", 11.7)
-                speed_scale = min(1.0, (self.step_speed * 0.88) / max(1.0, walk_spd))
 
-        if not farming_loot and goal_z > z + 2.0 and dist_goal < 26.0 and energy > 22.0:
-            if grounded:
-                want_jump = True
-            want_boost = True
+        # Fast-climb jetpack onto low/medium rooftops (only if we have >= 45 energy so we never stall mid-air!)
+        if not farming_loot and not capturing_drop and goal_z > z + 2.0 and dist_goal < 24.0:
+            if (not grounded and energy > 12.0) or (grounded and energy >= 48.0):
+                if grounded:
+                    want_jump = True
+                want_boost = True
 
         if speed_scale > 0.05 and not want_boost:
             probe_x = x + math.cos(move_yaw) * 4.5
             probe_y = y + math.sin(move_yaw) * 4.5
             if self.arena.is_blocked(probe_x, probe_y, z):
-                if dist_goal < 28.0 and goal_z > z + 2.0 and energy > 25.0:
+                if dist_goal < 26.0 and goal_z > z + 2.0 and energy >= 45.0:
                     if grounded:
                         want_jump = True
                     want_boost = True
@@ -585,7 +543,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v13 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v14 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
