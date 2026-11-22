@@ -1,4 +1,4 @@
-"""v31 - v30 + active laser hunt (waypoint exploration, crate priority, cautious until armed)."""
+"""v32 Built on v31 (3.96): Progressive Laser Release, Anti-2v1 Flee Boost & 15-Cube 5th Upgrade Tier."""
 import json
 import math
 import os
@@ -176,7 +176,7 @@ class ArenaMap:
 
 UPGRADE_WEIGHTS = {
     "armor": 100, "nanites": 96, "plating": 92, "laser_charge": 88, "laser_damage": 84,
-    "jets": 78, "capacitor": 75, "gun_rate": 70, "gun_damage": 66, "gyros": 62,
+    "jets": 78, "capacitor": 75, "gun_rate": 72, "gun_damage": 68, "gyros": 62,
     "servos": 60, "reactor": 58, "gun_velocity": 55, "lightning_efficiency": 52,
     "lightning_range": 50, "mortar_reload": 10, "mortar_velocity": 8, "gun_mag": 42,
     "sensors": 35,
@@ -193,6 +193,7 @@ class Bot:
         self.cw = {k: (W.get(k) or {}) for k in ("gun", "laser", "lightning", "mortar")}
         cubes = cfg.get("cubes", {}) or {}
         self.cube_cap = int(cubes.get("stat_cap", 10))
+        self.cube_upgrade_goal = 15
         self.dpc = float(cubes.get("damage_per_cube", 0.04))
         self.reach = float((cfg.get("loot", {}) or {}).get("pickup_radius", 4.0))
         self.step_speed = float((cfg.get("sound", {}) or {}).get("step_speed", 5.0))
@@ -225,7 +226,6 @@ class Bot:
         self.wp_tick = -999
         self.visited = []
 
-    # ------------------------------------------------------------------ helpers
     def choose_upgrade(self, offer):
         best_i, best_s = 0, -1
         for i, c in enumerate(offer.get("choices", [])):
@@ -315,7 +315,7 @@ class Bot:
                 ex, ey, ez = th["pos"]
                 if not self.arena.has_clear_shot(ex, ey, ez + 8.0, px, py, z + 4.5):
                     hid += 1
-            sc = s + 0.9 * hid
+            sc = s + 1.1 * hid
             if sc > best_s:
                 best_s, best = sc, yaw
         if best is None:
@@ -427,7 +427,6 @@ class Bot:
         pitch = clamp(math.atan2(tz - mz, max(0.1, h)), self.min_pitch, self.max_pitch)
         return yaw, pitch
 
-    # --------------------------------------------------------------------- act
     def act(self, obs):
         t0 = time.perf_counter()
         tick = int(obs["tick"])
@@ -475,7 +474,6 @@ class Bot:
 
         self.update_mem(obs, x, y, tick)
 
-        # ---------------------------------------------------------- weapon swaps
         weapons = me["weapons"]
         w0 = weapons[0] if len(weapons) > 0 else None
         w1 = weapons[1] if len(weapons) > 1 else None
@@ -503,7 +501,6 @@ class Bot:
         mine_kinds = [w["kind"] for w in mine]
         mult_me = 1.0 + self.dpc * min(cubes, self.cube_cap)
 
-        # --------------------------------------------------------------- zone
         zone = obs["zone"]
         zcx, zcy = zone["center"]
         zrad = zone["radius"]
@@ -519,7 +516,6 @@ class Bot:
             self.anchor = self.pick_anchor(x, y, zone, alive)
             self.anchor_tick = tick
 
-        # ------------------------------------------------------------ contacts
         enemies, npcs = [], []
         for m in obs.get("mechs", []) or []:
             m["_d"] = hyp(m["pos"][0], m["pos"][1], x, y)
@@ -535,7 +531,7 @@ class Bot:
             else:
                 m["_clear"] = False
 
-        # ------------------------------------------------------ fight / flee
+        # Fight / Flee evaluator (fixed close-range & 2v1 thresholds)
         target = None
         fight = False
         R = 0.0
@@ -577,9 +573,12 @@ class Bot:
                 tri *= 0.8
             R = ttk_them / max(0.1, ttk_me) * tri
             engaged = tick - self.engaged_tick < 25
-            thr = 1.3 if d_t > 100.0 else (0.9 if d_t > 45.0 else 0.5)
+            # Don't commit to losing 2-to-1 close-range trades; penalize 2v1s
+            thr = 1.25 if d_t > 100.0 else (0.95 if d_t > 45.0 else 0.80)
+            if len(contacts) >= 2:
+                thr += 0.35
             if engaged:
-                thr *= 0.8
+                thr *= 0.85
             if tick < self.flee_until:
                 thr *= 1.25
             if "laser" in mine_kinds:
@@ -591,9 +590,8 @@ class Bot:
                 self.engaged_tick = tick
                 self.cur_target_id = target["id"]
             else:
-                self.flee_until = max(self.flee_until, tick + 15)
+                self.flee_until = max(self.flee_until, tick + 18)
 
-        # ------------------------------------------------------------- movement
         goal = None
         goal_kind = "anchor"
         mode = "calm"
@@ -613,11 +611,10 @@ class Bot:
         lacks_laser = ("laser" not in mine_kinds)
         farm_r = 100.0 if lacks_laser else 62.0
 
-        # opportunistic farm target (aim/fire) when calm
         if not contacts and hpf > 0.5:
             cand = []
-            if cubes < self.cube_cap:
-                cand += [n for n in npcs if n["_d"] < farm_r]
+            if cubes < self.cube_upgrade_goal:
+                cand += [n for n in npcs if n["_d"] < (farm_r if cubes < self.cube_cap else 50.0)]
             for c in obs.get("crates", []) or []:
                 dd = hyp(c["pos"][0], c["pos"][1], x, y)
                 if dd < farm_r:
@@ -631,7 +628,6 @@ class Bot:
                     break
 
         if mode == "calm":
-            # supply drop
             for dr in obs.get("drops", []) or []:
                 if (dr.get("lands_in", 99.0) <= 12.0 and dr.get("holder") in (None, me["id"])
                         and hpf > 0.4 and hyp(dr["pos"][0], dr["pos"][1], x, y) < 150.0 and not urgent_zone):
@@ -661,11 +657,13 @@ class Bot:
                     e = best[1]
                     goal = (e[0], e[1], e[2])
                     goal_kind = "weapon"
-                if goal is None and cubes < self.cube_cap:
+                # Grab cubes up to 15 (tighter 50m radius past 10 to unlock 5th upgrade without overextending)
+                if goal is None and cubes < self.cube_upgrade_goal:
+                    cube_r = 85.0 if cubes < self.cube_cap else 50.0
                     bc = None
                     for i, e in self.mem["cubes"].items():
                         dd = hyp(e[0], e[1], x, y)
-                        if dd < 85.0 and abs(e[2] - z) < 13.0 and (e[2] - z < 3.0 or energy > 55.0):
+                        if dd < cube_r and abs(e[2] - z) < 13.0 and (e[2] - z < 3.0 or energy > 55.0):
                             if bc is None or dd < bc[0]:
                                 bc = (dd, e)
                     if bc is not None:
@@ -745,7 +743,8 @@ class Bot:
             vy_ = ay * 0.75 + zy / zn * 0.30
             desired = math.atan2(vy_, vx_)
             near_t = contacts[0]["_d"]
-            boost = bool(near_t < 75.0 and energy > 35.0)
+            # Boost into cover whenever close OR actively taking fire
+            boost = bool((near_t < 85.0 or (tick - self.last_dmg_tick <= 15)) and energy > 30.0)
             tcl = target
         else:
             if urgent_zone:
@@ -766,7 +765,6 @@ class Bot:
             else:
                 desired = goal_yaw
 
-        # zone override during fight/flee
         if mode in ("fight", "flee") and urgent_zone:
             zyaw = math.atan2(ncy - y, ncx - x) if in_zone else math.atan2(zcy - y, zcx - x)
             vx_ = math.cos(desired) * 0.5 + math.cos(zyaw) * 1.0
@@ -775,7 +773,6 @@ class Bot:
             if not in_zone and energy > 20.0:
                 boost = True
 
-        # dodge overlay: incoming shells/bullets that will actually hit
         dodge_yaw = None
         best_tt = 9.0
         for pr in obs.get("projectiles", []) or []:
@@ -822,7 +819,6 @@ class Bot:
             if energy > 40.0 and best_tt < 0.8:
                 boost = True
 
-        # ------------------------------------------------- heading + obstacles
         move_yaw = desired
         climb_ok = (gz > z + 2.5 and dist_goal < 45.0 and mode == "calm" and goal_kind != "farm")
         slow_for_time = (time.perf_counter() - t0) > 0.030
@@ -857,7 +853,6 @@ class Bot:
         out["boost"] = bool(boost)
         out["jump"] = bool(jump)
 
-        # ------------------------------------------------------- aim and fire
         fire = [False, False]
         gun_i = laser_i = lt_i = None
         for i, w in enumerate(weapons):
@@ -901,9 +896,11 @@ class Bot:
                     fire[laser_i] = True
                     if charge >= full - 0.04:
                         cmd_yaw, cmd_pitch = dir_yaw, dir_pitch
-                        tol_l = clamp(math.atan2(2.4, max(10.0, td)) * 0.85, 0.012, 0.09)
+                        # Progressive tolerance so we don't walk at 50% speed for 2s chasing a 0.015 rad lock
+                        over = max(0.0, charge - full)
+                        tol_l = clamp(math.atan2(2.4, max(10.0, td)) * (0.95 + over * 2.5), 0.016, 0.14)
                         err_l = math.hypot(wrap(dir_yaw - ayaw) * math.cos(apitch), (dir_pitch - apitch) * 0.5)
-                        if err_l < tol_l:
+                        if err_l < tol_l or over > 0.45:
                             fire[laser_i] = False
                 elif ready and mode == "fight" and td <= 262.0:
                     fire[laser_i] = True
@@ -928,7 +925,6 @@ class Bot:
                     fire[lt_i] = True
             out["aim"] = [cmd_yaw, cmd_pitch]
         else:
-            # release a laser that is charging with nothing to shoot
             if laser_i is not None and float(weapons[laser_i].get("charge", 0.0) or 0.0) > 0.0:
                 fire[laser_i] = False
             look = None
@@ -953,7 +949,6 @@ class Bot:
         return out
 
 
-# ------------------------------------------------------------------------ I/O
 def send(obj):
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + NL)
     sys.stdout.flush()
@@ -988,7 +983,6 @@ def main():
     bot = Bot(hello)
     send({"type": "ready", "name": Bot.name})
 
-    last_tick_sent = -1
     while True:
         raw = q.get()
         batch = [raw]
