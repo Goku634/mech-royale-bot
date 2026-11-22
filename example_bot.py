@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from array import array
+from collections import deque
 
 TAU = 2.0 * math.pi
 NL = chr(10)
@@ -182,6 +183,7 @@ UPGRADE_WEIGHTS = {
     "sensors": 35,
 }
 WEAPON_RANK = {"laser": 4, "lightning": 3}
+KC = {"gun": "g", "laser": "L", "lightning": "T", "mortar": "M"}
 
 
 class Bot:
@@ -224,6 +226,9 @@ class Bot:
         self.wp = None
         self.wp_tick = -999
         self.visited = []
+        self.ring = deque(maxlen=60)
+        self.last_status = -999
+        self.dmg_lines = 0
 
     # ------------------------------------------------------------------ helpers
     def choose_upgrade(self, offer):
@@ -427,6 +432,12 @@ class Bot:
         pitch = clamp(math.atan2(tz - mz, max(0.1, h)), self.min_pitch, self.max_pitch)
         return yaw, pitch
 
+    def dump(self, end_msg):
+        log("END", json.dumps(end_msg, separators=(",", ":")))
+        log("FIELDS tick,t,hp,energy,x,y,z,mode,goal,R,contacts,alive,weapons(g=gun L=laser T=lightning M=mortar),laser_charge,target[id,dist,hp,weapons,clear],damage[[weapon,amount,by,rear]],fire,urgent_zone,cubes")
+        for rec in self.ring:
+            log("LAST", json.dumps(rec, separators=(",", ":")))
+
     # --------------------------------------------------------------------- act
     def act(self, obs):
         t0 = time.perf_counter()
@@ -583,7 +594,7 @@ class Bot:
             if tick < self.flee_until:
                 thr *= 1.25
             if "laser" in mine_kinds:
-                thr *= 1.1
+                thr *= 0.85
             elif "lightning" not in mine_kinds:
                 thr *= 1.3
             fight = R >= thr
@@ -950,6 +961,36 @@ class Bot:
                     out["reload"] = True
 
         out["fire"] = [bool(fire[0]), bool(fire[1])]
+        try:
+            dm = []
+            for ev in obs.get("events", []) or []:
+                if ev.get("type") == "damaged":
+                    dm.append([ev.get("weapon"), int(ev.get("amount", 0)), ev.get("by"), bool(ev.get("rear"))])
+            tinfo = None
+            if target is not None:
+                tinfo = [target["id"], int(target["_d"]), int(target.get("hp", 0)),
+                         "".join(KC.get(k, "?") for k in target.get("_kinds", [])), 1 if target.get("_clear") else 0]
+            lch = 0.0
+            for w in mine:
+                if w["kind"] == "laser":
+                    lch = round(float(w.get("charge", 0.0) or 0.0), 2)
+            rec = [tick, round(t, 1), int(hp), int(energy), int(x), int(y), int(z), mode, goal_kind, round(R, 2),
+                   len(contacts), alive, "".join(KC.get(k, "?") for k in mine_kinds), lch, tinfo, dm,
+                   [int(fire[0]), int(fire[1])], int(urgent_zone), cubes]
+            self.ring.append(rec)
+            if dm and self.dmg_lines < 120:
+                self.dmg_lines += 1
+                log("DMG", json.dumps(rec, separators=(",", ":")))
+            if tick - self.last_status >= 100:
+                self.last_status = tick
+                log("ST", json.dumps(rec, separators=(",", ":")))
+            dbg = {"label": mode + " R" + str(round(R, 1)) + " " + goal_kind}
+            if target is not None:
+                dbg["lines"] = [{"a": [x, y, z + 7.0], "b": [target["pos"][0], target["pos"][1], target["pos"][2] + 4.5],
+                                 "color": "#ff5040"}]
+            out["debug"] = dbg
+        except Exception:
+            pass
         return out
 
 
@@ -1000,6 +1041,7 @@ def main():
         obs = None
         for r in batch:
             if r is None:
+                bot.dump({"eof": 1})
                 return
             try:
                 m = json.loads(r)
@@ -1007,6 +1049,7 @@ def main():
                 continue
             tp = m.get("type")
             if tp == "end":
+                bot.dump(m)
                 return
             if tp == "obs":
                 obs = m
