@@ -585,7 +585,7 @@ class Bot:
             if "laser" in mine_kinds:
                 thr *= 0.85
             elif "lightning" not in mine_kinds:
-                thr *= 1.3
+                thr *= 2.0
             fight = R >= thr
             if fight:
                 self.engaged_tick = tick
