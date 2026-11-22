@@ -1,4 +1,4 @@
-"""v16 Built on v15 (2.68): Pre-Aimed Front Armor, Roof-Center Tether & Gun+Special Slot Lock."""
+"""v17 Built on v16 (2.86): Silent Roof Micro-Weave, Split Ballistic/Hitscan Aim & 135m Supply Drops."""
 import json
 import math
 import os
@@ -304,7 +304,6 @@ class Bot:
                 self.last_threat_yaw = s["bearing"]
                 self.last_threat_tick = tick
 
-        # Always keep Gun in Slot 0; only fill/upgrade Slot 1 with special weapons (Laser > Lightning > Mortar)
         w0, w1 = me["weapons"][0], me["weapons"][1]
         best_pickup = None
         for p in obs.get("pickups", []):
@@ -342,11 +341,12 @@ class Bot:
 
         goal_x, goal_y, goal_z = self.anchor
 
+        # 135m Uncontested Supply Drop priority (+3 cubes + full HP & energy restore!)
         capturing_drop = False
-        if not urgent_zone and len(mechs) <= 1 and (cubes < self.cube_cap or hp_frac < 0.70):
+        if not urgent_zone and len(mechs) <= 1 and (cubes < self.cube_cap or hp_frac < 0.82):
             for dr in obs.get("drops", []):
-                if dr.get("lands_in", 99.0) <= 10.0 and dr.get("holder") in (None, me["id"]):
-                    if math.dist(dr["pos"][:2], (x, y)) < 90.0:
+                if dr.get("lands_in", 99.0) <= 12.0 and dr.get("holder") in (None, me["id"]):
+                    if math.dist(dr["pos"][:2], (x, y)) < 135.0:
                         goal_x, goal_y, goal_z = dr["pos"]
                         capturing_drop = True
                         break
@@ -383,6 +383,7 @@ class Bot:
         speed_scale = 1.0
         want_boost = False
         want_jump = False
+        micro_weaving = False
 
         enemy_charging = next((m for m in mechs if m.get("charging")), None)
         incoming = [pr for pr in obs.get("projectiles", []) if math.dist(pr["pos"][:2], (x, y)) < 36.0]
@@ -417,7 +418,6 @@ class Bot:
                 )
                 want_boost = bool(hp_frac < 0.40 and energy > 25.0)
             elif z > ez + 5.0 and dist_goal < 14.0:
-                # Roof-Center Tether: never strafe off the edge of our roof!
                 if dist_goal > 5.5:
                     move_yaw = math.atan2(goal_y - y, goal_x - x)
                     speed_scale = 0.85
@@ -431,10 +431,17 @@ class Bot:
                     radial * math.cos(away_yaw) + 0.85 * math.cos(strafe_yaw),
                 )
         else:
-            if dist_goal < 3.5 and abs(z - goal_z) < 2.0:
-                speed_scale = 0.0
+            # Never stand dead-still (prevents sniper headshots); silent <5 m/s weave around anchor
+            if dist_goal < 4.5 and abs(z - goal_z) < 2.0:
+                orbit_ang = (tick * 0.14) % (2.0 * math.pi)
+                wx = goal_x + math.cos(orbit_ang) * 2.8
+                wy = goal_y + math.sin(orbit_ang) * 2.8
+                move_yaw = math.atan2(wy - y, wx - x)
+                walk_spd = me.get("stats", {}).get("walk_speed", 11.7)
+                speed_scale = min(0.42, (self.step_speed * 0.86) / max(1.0, walk_spd))
+                micro_weaving = True
 
-        if speed_scale > 0.05:
+        if speed_scale > 0.05 and not micro_weaving:
             probe_x = x + math.cos(move_yaw) * 5.0
             probe_y = y + math.sin(move_yaw) * 5.0
             wall = self.arena.blocking_prism(probe_x, probe_y, z, pad=2.8)
@@ -454,7 +461,7 @@ class Bot:
         if not grounded and goal_z > z + 0.5 and dist_goal < 28.0 and energy > 10.0:
             want_boost = True
 
-        if self.stuck_ticks >= 4 and speed_scale > 0.05:
+        if self.stuck_ticks >= 4 and speed_scale > 0.05 and not micro_weaving:
             move_yaw = wrap_angle(move_yaw + (1.4 if (tick // 8) % 2 == 0 else -1.4))
             if energy > 25.0:
                 if grounded:
@@ -522,9 +529,17 @@ class Bot:
             tvx, tvy, tvz = target_vel
             dist = math.hypot(tx - x, ty - y)
 
-            has_laser_ready = any(w and w["kind"] == "laser" and w.get("cooldown", 0.0) <= 0.05 for w in me["weapons"])
+            # Split Ballistic vs Hitscan Aiming:
+            # Lead bullets while charging; snap straight to body on the exact tick Laser releases!
+            laser_ready_to_release = False
+            for w in me["weapons"]:
+                if w and w["kind"] == "laser" and not target_is_occluded and target_is_mech:
+                    req_c = float(w.get("stats", {}).get("charge", 0.75)) * 0.84
+                    if float(w.get("charge", 0.0)) >= req_c:
+                        laser_ready_to_release = True
+
             proj_speed = w0.get("stats", {}).get("speed", 252.0) if (w0 and w0["kind"] == "gun") else 252.0
-            tof = 0.0 if (has_laser_ready and not target_is_occluded) else (dist / max(50.0, proj_speed))
+            tof = 0.0 if laser_ready_to_release else (dist / max(50.0, proj_speed))
 
             lead_x = tx + tvx * tof
             lead_y = ty + tvy * tof
@@ -577,12 +592,11 @@ class Bot:
 
             mf.draw.line([x, y, muzzle_z], [lead_x, lead_y, lead_z], "#ff5040")
         else:
-            # Keep 180-deg front armor facing threats/zone center instead of exposing our back!
             if mechs:
                 act["aim"] = [math.atan2(mechs[0]["pos"][1] - y, mechs[0]["pos"][0] - x), 0.0]
             elif tick - self.last_threat_tick < 60 and self.last_threat_yaw is not None:
                 act["aim"] = [self.last_threat_yaw, 0.0]
-            elif speed_scale < 0.1:
+            elif micro_weaving:
                 center_yaw = math.atan2(ncy - y, ncx - x)
                 act["aim"] = [wrap_angle(center_yaw + 0.95 * math.sin(tick * 0.18)), 0.0]
             else:
@@ -593,7 +607,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v16 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v17 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
