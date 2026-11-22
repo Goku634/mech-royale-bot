@@ -1,4 +1,4 @@
-"""v8 Proven v6 Base + Dual-Weapon DPS & Edge-Rooftop Survival."""
+"""v9 Protocol-Optimized AI: Hitscan Laser Release, Pitch-Locked Ballistics, 10-Cube Cap & Canopy Cover."""
 import json
 import math
 import os
@@ -32,6 +32,7 @@ class ArenaMap:
         self.prisms = []
         self.rooftops = []
         self.cover_spots = []
+        self.tree_clusters = []
         self.terrain = None
         self.nx = 0
         self.ny = 0
@@ -73,6 +74,21 @@ class ArenaMap:
                             d = math.hypot(dx, dy)
                             if d > 1.0:
                                 self.cover_spots.append((vx + (dx / d) * 4.2, vy + (dy / d) * 4.2))
+
+            # Parse dense tree crowns (trees block enemy vision >45m, NOT our bullets!)
+            trees_obj = w.get("trees", {})
+            t_fields = trees_obj.get("fields", [])
+            t_data = trees_obj.get("data", [])
+            if t_fields and t_data:
+                stride = len(t_fields)
+                ix = t_fields.index("x") if "x" in t_fields else 0
+                iy = t_fields.index("y") if "y" in t_fields else 1
+                iz = t_fields.index("z") if "z" in t_fields else 2
+                icr = t_fields.index("crownR") if "crownR" in t_fields else -1
+                for i in range(0, len(t_data) - stride + 1, stride * 3):
+                    cr = float(t_data[i + icr]) if icr >= 0 else 4.0
+                    if cr >= 3.5:
+                        self.tree_clusters.append((float(t_data[i + ix]), float(t_data[i + iy]), float(t_data[i + iz])))
 
             t_meta = w.get("terrain", {})
             self.nx = int(t_meta.get("nx", 0))
@@ -153,6 +169,8 @@ class Bot:
         cfg = hello.get("config", {})
         self.reach = float(cfg.get("loot", {}).get("pickup_radius", 4.0))
         self.step_speed = float(cfg.get("sound", {}).get("step_speed", 5.0))
+        self.cube_cap = int(cfg.get("cubes", {}).get("stat_cap", 10))
+        self.mortar_g = float(cfg.get("weapons", {}).get("mortar", {}).get("gravity", 22.0))
         map_dir = hello.get("map", {}).get("dir", "/arena")
         self.arena = ArenaMap(map_dir)
 
@@ -167,7 +185,7 @@ class Bot:
 
     def _choose_upgrade(self, offer: dict) -> int:
         choices = offer.get("choices", [])
-        priority = ["armor", "regen", "hp", "laser", "lightning", "speed", "energy", "gun", "sensors"]
+        priority = ["armor", "regen", "hp", "laser", "lightning", "gun_rate", "speed", "energy", "sensors"]
         best_idx, best_score = 0, -1
         for idx, c in enumerate(choices):
             cid = c.get("id", "").lower()
@@ -182,6 +200,7 @@ class Bot:
         return best_idx
 
     def _weapon_rank(self, kind: str) -> int:
+        # Laser (315 hitscan) > Lightning (chain + short) > Mortar (wall lob) > Gun
         return {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}.get(kind, 0)
 
     def _pick_anchor(self, x: float, y: float, z: float, zone: dict, alive: int, cubes: int) -> tuple:
@@ -189,6 +208,7 @@ class Bot:
         nrad = zone["next_radius"]
         max_r = max(14.0, nrad * 0.85)
 
+        # Early game: use building cover + tree canopy camouflage while farming up to 10 cubes
         if alive > 7 and cubes < 7 and self.arena.cover_spots:
             nearby = []
             for sx, sy in self.arena.cover_spots:
@@ -213,6 +233,7 @@ class Bot:
             if best is not None:
                 return best
 
+        # Mid/Late game: outer-ring rooftops for 280m Laser & Mortar dominance
         best = None
         best_score = -1e9
         for rx, ry, rtop in self.arena.rooftops:
@@ -222,7 +243,6 @@ class Bot:
             d_me = math.hypot(rx - x, ry - y)
             if d_me > 185.0:
                 continue
-            # Favor rooftops in the outer safe ring (40%-85% radius) to avoid 360-degree crossfire
             score = -d_me * 0.65 + min(34.0, rtop) * 1.5
             if nrad * 0.40 <= d_next <= max_r:
                 score += 55.0
@@ -235,6 +255,16 @@ class Bot:
         ang = math.atan2(y - ncy, x - ncx)
         return (ncx + math.cos(ang) * (max_r * 0.72), ncy + math.sin(ang) * (max_r * 0.72), 0.0)
 
+    def _mortar_pitch(self, dist: float, dz: float, speed: float) -> float:
+        g = self.mortar_g
+        v2 = speed * speed
+        disc = v2 * v2 - g * (g * dist * dist + 2.0 * dz * v2)
+        if disc < 0.0:
+            return 0.72
+        # Low-arc fast shell solution
+        tan_theta = (v2 - math.sqrt(disc)) / max(1.0, g * dist)
+        return math.atan(tan_theta)
+
     def act(self, obs: mf.Observation) -> mf.Action:
         tick = obs["tick"]
         t = obs["t"]
@@ -245,6 +275,7 @@ class Bot:
         in_zone = bool(me["in_zone"])
         grounded = bool(me["grounded"])
         alive = int(obs["alive"])
+        cubes = int(me["cubes"])
 
         if tick % 20 == 0:
             self.strafe_dir *= -1.0
@@ -281,6 +312,7 @@ class Bot:
         if mechs:
             self.spotted_until_tick = max(self.spotted_until_tick, tick + 55)
 
+        # Smart weapon pickup & upgrade swap (keep Gun in slot 0, best special in slot 1)
         w0, w1 = me["weapons"][0], me["weapons"][1]
         best_pickup = None
         for p in obs.get("pickups", []):
@@ -292,7 +324,9 @@ class Bot:
                     best_pickup = p
 
         if best_pickup:
-            if w1 is None or w0 is None:
+            if w1 is None:
+                act["take"] = best_pickup["id"]
+            elif w0 is None:
                 act["take"] = best_pickup["id"]
             else:
                 r0, r1 = self._weapon_rank(w0["kind"]), self._weapon_rank(w1["kind"])
@@ -315,22 +349,24 @@ class Bot:
 
         if (self.anchor is None or tick - self.anchor_tick > 55 or
                 math.hypot(self.anchor[0] - ncx, self.anchor[1] - ncy) > nrad * 0.88):
-            self.anchor = self._pick_anchor(x, y, z, zone, alive, me["cubes"])
+            self.anchor = self._pick_anchor(x, y, z, zone, alive, cubes)
             self.anchor_tick = tick
 
         goal_x, goal_y, goal_z = self.anchor
 
+        # Farm cubes ONLY up to stat_cap (10) so we don't inflate our hitbox size!
         farming_loot = False
         if not urgent_zone and not mechs and hp_frac > 0.55:
-            near_cubes = [
-                c for c in obs.get("cubes", [])
-                if math.dist(c["pos"][:2], (x, y)) < 50.0 and abs(c["pos"][2] - z) < 12.0
-            ]
-            if near_cubes:
-                near_cubes.sort(key=lambda c: math.dist(c["pos"][:2], (x, y)))
-                goal_x, goal_y, goal_z = near_cubes[0]["pos"]
-                farming_loot = True
-            else:
+            if cubes < self.cube_cap:
+                near_cubes = [
+                    c for c in obs.get("cubes", [])
+                    if math.dist(c["pos"][:2], (x, y)) < 52.0 and abs(c["pos"][2] - z) < 12.0
+                ]
+                if near_cubes:
+                    near_cubes.sort(key=lambda c: math.dist(c["pos"][:2], (x, y)))
+                    goal_x, goal_y, goal_z = near_cubes[0]["pos"]
+                    farming_loot = True
+            if not farming_loot:
                 near_weaps = [
                     p for p in obs.get("pickups", [])
                     if math.dist(p["pos"][:2], (x, y)) < 42.0 and abs(p["pos"][2] - z) < 10.0 and self._weapon_rank(p["kind"]) >= 2
@@ -338,6 +374,14 @@ class Bot:
                 if near_weaps:
                     goal_x, goal_y, goal_z = near_weaps[0]["pos"]
                     farming_loot = True
+
+        # Avoid excess cubes after hitting 10 so hitbox stays small
+        avoid_cube = None
+        if cubes >= self.cube_cap:
+            for c in obs.get("cubes", []):
+                if math.dist(c["pos"][:2], (x, y)) < 6.0 and abs(c["pos"][2] - z) < 4.0:
+                    avoid_cube = c["pos"]
+                    break
 
         dist_goal = math.hypot(goal_x - x, goal_y - y)
         move_yaw = math.atan2(goal_y - y, goal_x - x)
@@ -354,6 +398,9 @@ class Bot:
         elif urgent_zone:
             move_yaw = math.atan2(ncy - y, ncx - x)
             want_boost = bool((not in_zone) and energy > 20.0)
+        elif avoid_cube is not None:
+            move_yaw = math.atan2(y - avoid_cube[1], x - avoid_cube[0])
+            speed_scale = 0.8
         elif mechs:
             closest = mechs[0]
             ex, ey, ez = closest["pos"]
@@ -414,16 +461,24 @@ class Bot:
         act["boost"] = bool(want_boost)
         act["jump"] = bool(want_jump)
 
+        # Combat: True Laser Charge-and-Release + Pitch-Locked Aim + Mortar Over-Wall Lob
         muzzle_z = z + me.get("stats", {}).get("muzzle_height", 7.0)
         fire = [False, False]
-        target_pos = None
-        target_vel = [0.0, 0.0, 0.0]
-        target_h = 4.5
+        has_mortar = any(w and w["kind"] == "mortar" for w in me["weapons"])
 
         clear_mechs = [
             m for m in mechs
             if self.arena.has_clear_shot(x, y, muzzle_z, m["pos"][0], m["pos"][1], m["pos"][2] + 4.5)
         ]
+        # If holding Mortar, we can also lob shells over buildings at tracked mechs!
+        occluded_mechs = [m for m in mechs if m not in clear_mechs] if has_mortar else []
+
+        target_obj = None
+        target_is_mech = False
+        target_is_occluded = False
+        target_pos = None
+        target_vel = [0.0, 0.0, 0.0]
+        target_h = 4.5
 
         if clear_mechs:
             def target_score(m):
@@ -432,18 +487,29 @@ class Bot:
                 to_me = math.atan2(y - m["pos"][1], x - m["pos"][0])
                 e_yaw = m.get("aim", [0.0, 0.0])[0]
                 is_rear = abs(wrap_angle(to_me - e_yaw)) > (math.pi * 0.5)
-                return d + hp * 0.06 - (45.0 if is_rear else 0.0)
+                # Cook-off bonus (+60% laser dmg) if target holds a mortar!
+                holds_mortar = "mortar" in m.get("weapons", [])
+                return d + hp * 0.06 - (50.0 if is_rear else 0.0) - (35.0 if holds_mortar else 0.0)
 
-            best_m = min(clear_mechs, key=target_score)
-            target_pos = best_m["pos"]
-            target_vel = best_m.get("vel", [0.0, 0.0, 0.0])
+            target_obj = min(clear_mechs, key=target_score)
+            target_is_mech = True
+            target_pos = target_obj["pos"]
+            target_vel = target_obj.get("vel", [0.0, 0.0, 0.0])
             target_h = 4.5
-        elif not mechs and npcs and me["cubes"] < 12 and hp_frac > 0.60 and math.dist(npcs[0]["pos"][:2], (x, y)) < 55.0:
+        elif occluded_mechs and math.dist(occluded_mechs[0]["pos"][:2], (x, y)) <= 190.0:
+            target_obj = occluded_mechs[0]
+            target_is_mech = True
+            target_is_occluded = True
+            target_pos = target_obj["pos"]
+            target_vel = target_obj.get("vel", [0.0, 0.0, 0.0])
+            target_h = 2.0
+        elif not mechs and npcs and cubes < self.cube_cap and hp_frac > 0.60 and math.dist(npcs[0]["pos"][:2], (x, y)) < 55.0:
             if self.arena.has_clear_shot(x, y, muzzle_z, npcs[0]["pos"][0], npcs[0]["pos"][1], npcs[0]["pos"][2] + 1.8):
+                target_obj = npcs[0]
                 target_pos = npcs[0]["pos"]
                 target_vel = npcs[0].get("vel", [0.0, 0.0, 0.0])
                 target_h = 1.8
-        elif not mechs and obs.get("crates") and me["cubes"] < 12 and hp_frac > 0.65:
+        elif not mechs and obs.get("crates") and cubes < self.cube_cap and hp_frac > 0.65:
             crates = sorted(obs["crates"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
             if math.dist(crates[0]["pos"][:2], (x, y)) < 40.0:
                 if self.arena.has_clear_shot(x, y, muzzle_z, crates[0]["pos"][0], crates[0]["pos"][1], crates[0]["pos"][2] + 1.2):
@@ -455,8 +521,12 @@ class Bot:
             tx, ty, tz = target_pos
             tvx, tvy, tvz = target_vel
             dist = math.hypot(tx - x, ty - y)
+
+            # Hitscan laser aims straight at current body (zero lead); ballistic gun leads by TOF
+            has_laser_ready = any(w and w["kind"] == "laser" and w.get("cooldown", 0.0) <= 0.05 for w in me["weapons"])
             proj_speed = w0.get("stats", {}).get("speed", 252.0) if (w0 and w0["kind"] == "gun") else 252.0
-            tof = dist / max(50.0, proj_speed)
+            tof = 0.0 if (has_laser_ready and not target_is_occluded) else (dist / max(50.0, proj_speed))
+
             lead_x = tx + tvx * tof
             lead_y = ty + tvy * tof
             lead_z = tz + target_h + tvz * tof
@@ -464,23 +534,45 @@ class Bot:
             aim_pitch = math.atan2(lead_z - muzzle_z, max(1.0, math.hypot(lead_x - x, lead_y - y)))
             act["aim"] = [aim_yaw, aim_pitch]
 
-            aim_err = abs(wrap_angle(aim_yaw - me["aim"][0]))
-            if aim_err < 0.24:
-                for slot_idx, w in enumerate(me["weapons"]):
-                    if w is None:
-                        continue
-                    kind = w["kind"]
-                    if kind == "gun" and dist <= w.get("stats", {}).get("range", 230.0):
-                        fire[slot_idx] = True
-                    elif kind == "lightning" and dist <= 46.0 and energy > 15.0:
-                        fire[slot_idx] = True
-                    elif kind == "laser" and dist <= 275.0:
-                        fire[slot_idx] = bool(w.get("charge", 0.0) < 0.72)
-                    elif kind == "mortar" and 25.0 <= dist <= 185.0:
-                        g, v = 22.0, w.get("stats", {}).get("speed", 72.0)
-                        arg = min(1.0, max(-1.0, (g * dist) / (v * v)))
-                        act["aim"] = [aim_yaw, 0.5 * math.asin(arg)]
-                        fire[slot_idx] = True
+            yaw_err = abs(wrap_angle(aim_yaw - me["aim"][0]))
+            pitch_err = abs(aim_pitch - me["aim"][1])
+
+            for slot_idx, w in enumerate(me["weapons"]):
+                if w is None:
+                    continue
+                kind = w["kind"]
+                if kind == "laser":
+                    if target_is_occluded or not target_is_mech or dist > 278.0:
+                        fire[slot_idx] = False
+                    else:
+                        chg = float(w.get("charge", 0.0))
+                        # Hold fire=True to charge; release (fire=False) once charged & locked onto hitbox!
+                        if chg < 0.62:
+                            fire[slot_idx] = True
+                        else:
+                            # Release to fire hitscan beam if on target, else hold up to 1.4s while slewing
+                            if (yaw_err < 0.14 and pitch_err < 0.18) or chg > 1.35:
+                                fire[slot_idx] = False
+                            else:
+                                fire[slot_idx] = True
+                elif kind == "gun":
+                    if not target_is_occluded and dist <= w.get("stats", {}).get("range", 230.0):
+                        if yaw_err < 0.22 and pitch_err < 0.26:
+                            fire[slot_idx] = True
+                elif kind == "lightning":
+                    if not target_is_occluded and dist <= 45.0 and energy > 15.0:
+                        if yaw_err < 0.35:
+                            fire[slot_idx] = True
+                elif kind == "mortar":
+                    if 22.0 <= dist <= 215.0:
+                        v = w.get("stats", {}).get("speed", 72.0)
+                        mpitch = self._mortar_pitch(dist, (tz + target_h) - (z + 9.5), v)
+                        if target_is_occluded:
+                            mpitch = max(mpitch, 0.65)  # High arc over buildings
+                        act["aim"] = [aim_yaw, mpitch]
+                        if yaw_err < 0.22:
+                            fire[slot_idx] = True
+
             mf.draw.line([x, y, muzzle_z], [lead_x, lead_y, lead_z], "#ff5040")
         else:
             if mechs:
@@ -495,7 +587,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v8 | Z:{z:.0f} HP:{me['hp']:.0f} C:{me['cubes']:.0f}")
+        mf.draw.label(f"v9 | Z:{z:.0f} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
