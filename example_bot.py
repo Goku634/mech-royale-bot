@@ -1,4 +1,4 @@
-"""v18 Built on v17 (3.77): Exact Roof Safe-Inset, Lethal Execution Override & Storm-Safe Endgame."""
+"""v19 Built on v17 (3.77): Corner Laser Pre-Charge, Anti-Wall Discharge & High-Ground Retention."""
 import json
 import math
 import os
@@ -53,7 +53,6 @@ class ArenaMap:
                     base = float(p.get("base", 0.0))
                     top = float(p.get("top", 0.0))
                     cx, cy = (minx + maxx) * 0.5, (miny + maxy) * 0.5
-                    hx, hy = (maxx - minx) * 0.5, (maxy - miny) * 0.5
                     prism = {
                         "base": base,
                         "top": top,
@@ -66,8 +65,7 @@ class ArenaMap:
                     height = top - base
                     if 9.0 <= height <= 18.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                         if point_in_poly(cx, cy, ring) and not any(point_in_poly(cx, cy, h) for h in p.get("holes", [])):
-                            safe_r = max(3.2, min(hx, hy) - 3.2)
-                            self.rooftops.append((cx, cy, top, height, safe_r))
+                            self.rooftops.append((cx, cy, top, height))
                     if height >= 12.0 and (maxx - minx) >= 14.0 and (maxy - miny) >= 14.0:
                         for idx in range(0, len(ring), 4):
                             vx, vy = ring[idx], ring[idx + 1]
@@ -208,41 +206,34 @@ class Bot:
         return {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}.get(kind, 0)
 
     def _pick_anchor(self, x: float, y: float, z: float, zone: dict, alive: int, cubes: int) -> tuple:
-        zcx, zcy = zone["center"]
-        zrad = zone["radius"]
         ncx, ncy = zone["next_center"]
         nrad = zone["next_radius"]
-        max_r = max(14.0, nrad * 0.85)
+        max_r = max(14.0, nrad * 0.86)
 
         best = None
         best_score = -1e9
 
-        for rx, ry, rtop, h, safe_r in self.arena.rooftops:
+        for rx, ry, rtop, h in self.arena.rooftops:
             d_next = math.hypot(rx - ncx, ry - ncy)
             if d_next > max_r:
-                continue
-            d_curr = math.hypot(rx - zcx, ry - zcy)
-            if d_curr > zrad - 24.0:
                 continue
             d_me = math.hypot(rx - x, ry - y)
             if d_me > 185.0:
                 continue
-            # Bonus for wider roofs (safe_r) and storm-safe buffer inside current circle
-            score = -d_me * 0.60 + (22.0 - abs(h - 13.0)) * 1.6 + min(8.0, safe_r) * 2.5
-            if nrad * 0.40 <= d_next <= max_r:
+            score = -d_me * 0.60 + (22.0 - abs(h - 13.0)) * 1.6
+            if nrad * 0.42 <= d_next <= max_r:
                 score += 65.0
             if alive <= 6:
-                score += 40.0
+                score += 35.0
             if score > best_score:
                 best_score = score
-                best = (rx, ry, rtop, safe_r)
+                best = (rx, ry, rtop)
 
         if alive > 5 and self.arena.cover_spots:
             nearby = []
             for sx, sy in self.arena.cover_spots:
                 d_next = math.hypot(sx - ncx, sy - ncy)
-                d_curr = math.hypot(sx - zcx, sy - zcy)
-                if d_next <= max_r and d_curr <= zrad - 24.0:
+                if d_next <= max_r:
                     d_me = math.hypot(sx - x, sy - y)
                     if d_me <= 165.0:
                         nearby.append((d_me, d_next, sx, sy))
@@ -255,12 +246,12 @@ class Bot:
                     score = -d_me * 0.60 + 82.0 + (45.0 if d_next >= nrad * 0.45 else 0.0)
                     if score > best_score:
                         best_score = score
-                        best = (sx, sy, gz, 3.2)
+                        best = (sx, sy, gz)
 
         if best is not None:
             return best
         ang = math.atan2(y - ncy, x - ncx)
-        return (ncx + math.cos(ang) * (max_r * 0.70), ncy + math.sin(ang) * (max_r * 0.70), 0.0, 3.2)
+        return (ncx + math.cos(ang) * (max_r * 0.72), ncy + math.sin(ang) * (max_r * 0.72), 0.0)
 
     def _mortar_pitch(self, dist: float, dz: float, speed: float) -> float:
         g = self.mortar_g
@@ -341,15 +332,15 @@ class Bot:
 
         dist_curr = math.hypot(x - zcx, y - zcy)
         dist_next = math.hypot(x - ncx, y - ncy)
-        urgent_zone = (not in_zone) or (dist_curr > zrad - 20.0) or (dist_next > nrad - 12.0 and t > zone["shrink_start"] - 14.0)
+        # Hold high ground up until 6s before shrink starts so we farm ground rotators
+        urgent_zone = (not in_zone) or (dist_curr > zrad - 14.0) or (dist_next > nrad - 10.0 and t > zone["shrink_start"] - 6.0)
 
         if (self.anchor is None or tick - self.anchor_tick > 55 or
-                math.hypot(self.anchor[0] - ncx, self.anchor[1] - ncy) > nrad * 0.88 or
-                math.hypot(self.anchor[0] - zcx, self.anchor[1] - zcy) > zrad - 20.0):
+                math.hypot(self.anchor[0] - ncx, self.anchor[1] - ncy) > nrad * 0.88):
             self.anchor = self._pick_anchor(x, y, z, zone, alive, cubes)
             self.anchor_tick = tick
 
-        goal_x, goal_y, goal_z, safe_r = self.anchor
+        goal_x, goal_y, goal_z = self.anchor
 
         capturing_drop = False
         if not urgent_zone and len(mechs) <= 1 and (cubes < self.cube_cap or hp_frac < 0.82):
@@ -397,13 +388,6 @@ class Bot:
         enemy_charging = next((m for m in mechs if m.get("charging")), None)
         incoming = [pr for pr in obs.get("projectiles", []) if math.dist(pr["pos"][:2], (x, y)) < 36.0]
 
-        # Check if we have a one-shot lethal execution opportunity on a wounded enemy
-        can_execute = False
-        if mechs and hp_frac > 0.28:
-            has_laser = any(w and w["kind"] == "laser" for w in me["weapons"])
-            if mechs[0].get("hp", 1000) <= (360 if has_laser else 190):
-                can_execute = True
-
         if enemy_charging is not None:
             ex, ey, _ = enemy_charging["pos"]
             to_me = math.atan2(y - ey, x - ex)
@@ -427,19 +411,19 @@ class Bot:
             away_yaw = math.atan2(y - ey, x - ex)
             strafe_yaw = away_yaw + self.strafe_dir * (math.pi * 0.46)
 
-            if not can_execute and (hp_frac < 0.48 or len(mechs) >= 2):
+            if hp_frac < 0.50 or len(mechs) >= 2:
                 move_yaw = math.atan2(
                     0.65 * math.sin(away_yaw) + 0.35 * math.sin(move_yaw),
                     0.65 * math.cos(away_yaw) + 0.35 * math.cos(move_yaw),
                 )
-                want_boost = bool(hp_frac < 0.38 and energy > 25.0)
-            elif z > ez + 5.0 and dist_goal < safe_r + 6.0:
-                if dist_goal > safe_r:
+                want_boost = bool(hp_frac < 0.40 and energy > 25.0)
+            elif z > ez + 5.0 and dist_goal < 14.0:
+                if dist_goal > 5.5:
                     move_yaw = math.atan2(goal_y - y, goal_x - x)
                     speed_scale = 0.85
                 else:
                     move_yaw = strafe_yaw
-                    speed_scale = 0.72
+                    speed_scale = 0.70
             else:
                 radial = 0.25 if edist < 65.0 else -0.20
                 move_yaw = math.atan2(
@@ -447,11 +431,10 @@ class Bot:
                     radial * math.cos(away_yaw) + 0.85 * math.cos(strafe_yaw),
                 )
         else:
-            if dist_goal < safe_r + 1.0 and abs(z - goal_z) < 2.0:
-                orbit_r = min(2.8, safe_r * 0.75)
+            if dist_goal < 4.5 and abs(z - goal_z) < 2.0:
                 orbit_ang = (tick * 0.14) % (2.0 * math.pi)
-                wx = goal_x + math.cos(orbit_ang) * orbit_r
-                wy = goal_y + math.sin(orbit_ang) * orbit_r
+                wx = goal_x + math.cos(orbit_ang) * 2.8
+                wy = goal_y + math.sin(orbit_ang) * 2.8
                 move_yaw = math.atan2(wy - y, wx - x)
                 walk_spd = me.get("stats", {}).get("walk_speed", 11.7)
                 speed_scale = min(0.42, (self.step_speed * 0.86) / max(1.0, walk_spd))
@@ -491,6 +474,7 @@ class Bot:
         muzzle_z = z + me.get("stats", {}).get("muzzle_height", 7.0)
         fire = [False, False]
         has_mortar = any(w and w["kind"] == "mortar" for w in me["weapons"])
+        laser_charging_now = any(w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.02 for w in me["weapons"])
 
         clear_mechs = [
             m for m in mechs
@@ -513,9 +497,7 @@ class Bot:
                 e_yaw = m.get("aim", [0.0, 0.0])[0]
                 is_rear = abs(wrap_angle(to_me - e_yaw)) > (math.pi * 0.5)
                 holds_mortar = "mortar" in m.get("weapons", [])
-                # Strong execution priority for low-HP targets (<350 HP)
-                exec_bonus = 90.0 if hp <= 350 else 0.0
-                return d + hp * 0.06 - (50.0 if is_rear else 0.0) - (35.0 if holds_mortar else 0.0) - exec_bonus
+                return d + hp * 0.06 - (50.0 if is_rear else 0.0) - (35.0 if holds_mortar else 0.0)
 
             target_obj = min(clear_mechs, key=target_score)
             target_is_mech = True
@@ -529,14 +511,14 @@ class Bot:
             target_pos = target_obj["pos"]
             target_vel = target_obj.get("vel", [0.0, 0.0, 0.0])
             target_h = 2.0
-        elif not mechs and npcs and cubes < self.cube_cap and hp_frac > 0.60 and math.dist(npcs[0]["pos"][:2], (x, y)) < 55.0:
+        elif not mechs and npcs and (cubes < self.cube_cap or laser_charging_now) and hp_frac > 0.60 and math.dist(npcs[0]["pos"][:2], (x, y)) < 65.0:
             if self.arena.has_clear_shot(x, y, muzzle_z, npcs[0]["pos"][0], npcs[0]["pos"][1], npcs[0]["pos"][2] + 1.8):
                 target_pos = npcs[0]["pos"]
                 target_vel = npcs[0].get("vel", [0.0, 0.0, 0.0])
                 target_h = 1.8
-        elif not mechs and obs.get("crates") and cubes < self.cube_cap and hp_frac > 0.65:
+        elif not mechs and obs.get("crates") and (cubes < self.cube_cap or laser_charging_now) and hp_frac > 0.65:
             crates = sorted(obs["crates"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
-            if math.dist(crates[0]["pos"][:2], (x, y)) < 40.0:
+            if math.dist(crates[0]["pos"][:2], (x, y)) < 55.0:
                 if self.arena.has_clear_shot(x, y, muzzle_z, crates[0]["pos"][0], crates[0]["pos"][1], crates[0]["pos"][2] + 1.2):
                     target_pos = crates[0]["pos"]
                     target_vel = [0.0, 0.0, 0.0]
@@ -549,7 +531,7 @@ class Bot:
 
             laser_ready_to_release = False
             for w in me["weapons"]:
-                if w and w["kind"] == "laser" and not target_is_occluded and target_is_mech:
+                if w and w["kind"] == "laser" and not target_is_occluded:
                     req_c = float(w.get("stats", {}).get("charge", 0.75)) * 0.84
                     if float(w.get("charge", 0.0)) >= req_c:
                         laser_ready_to_release = True
@@ -573,7 +555,7 @@ class Bot:
                 kind = w["kind"]
                 if kind == "laser":
                     l_range = float(w.get("stats", {}).get("range", 280.0))
-                    if target_is_occluded or not target_is_mech or dist > l_range - 2.0:
+                    if target_is_occluded or dist > l_range - 2.0:
                         fire[slot_idx] = False
                     else:
                         chg = float(w.get("charge", 0.0))
@@ -608,8 +590,21 @@ class Bot:
 
             mf.draw.line([x, y, muzzle_z], [lead_x, lead_y, lead_z], "#ff5040")
         else:
+            # Corner Laser Pre-Charge: if enemy tracked within 90m behind cover, pre-aim & hold laser charge!
             if mechs:
-                act["aim"] = [math.atan2(mechs[0]["pos"][1] - y, mechs[0]["pos"][0] - x), 0.0]
+                ex, ey, ez = mechs[0]["pos"]
+                evx, evy, _ = mechs[0].get("vel", [0.0, 0.0, 0.0])
+                edist = math.hypot(ex - x, ey - y)
+                pred_x = ex + evx * 0.35
+                pred_y = ey + evy * 0.35
+                act["aim"] = [
+                    math.atan2(pred_y - y, pred_x - x),
+                    math.atan2((ez + 4.5) - muzzle_z, max(1.0, math.hypot(pred_x - x, pred_y - y))),
+                ]
+                for slot_idx, w in enumerate(me["weapons"]):
+                    if w and w["kind"] == "laser" and edist <= 110.0:
+                        if float(w.get("charge", 0.0)) < 1.35:
+                            fire[slot_idx] = True
             elif tick - self.last_threat_tick < 60 and self.last_threat_yaw is not None:
                 act["aim"] = [self.last_threat_yaw, 0.0]
             elif micro_weaving:
@@ -623,7 +618,7 @@ class Bot:
 
         act["fire"] = fire
         mf.draw.point([goal_x, goal_y, goal_z], "#40c0ff", 6)
-        mf.draw.label(f"v18 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
+        mf.draw.label(f"v19 | Alive:{alive} HP:{me['hp']:.0f} C:{cubes}")
         return act
 
 
